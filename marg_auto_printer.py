@@ -321,6 +321,35 @@ def print_pdf_silent(fp: str):
     try:
         if not os.path.exists(SUMATRA_PATH):
             log("SumatraPDF not found — legacy fallback", "WARN")
+            print_pdf_legacy(fp)
+            return
+
+        subprocess.Popen(
+            [
+                SUMATRA_PATH,
+                "-print-to", SELECTED_PRINTER,
+                "-print-settings", "noscale",
+                "-silent",
+                "-exit-on-print",
+                fp
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+
+        time.sleep(3)
+
+        if os.path.exists(fp):
+            os.remove(fp)
+
+    except Exception as e:
+        log(f"Silent print error: {e}", "ERROR")
+        print_pdf_legacy(fp)
+        
+    try:
+        if not os.path.exists(SUMATRA_PATH):
+            log("SumatraPDF not found — legacy fallback", "WARN")
             print_pdf_legacy(fp); return
         subprocess.Popen(
             [SUMATRA_PATH, "-print-to", SELECTED_PRINTER,

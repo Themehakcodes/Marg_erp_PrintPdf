@@ -1,0 +1,92 @@
+# SumatraPDF Settings - Optimized for 72mm Thermal Receipt Printing
+
+Theme = Light
+
+FixedPageUI [
+    TextColor = #000000
+    BackgroundColor = #ffffff
+    SelectionColor = #f5fc0c
+    WindowMargin = 0 0 0 0
+    PageSpacing = 0 0
+    InvertColors = false
+    HideScrollbars = false
+]
+
+ComicBookUI [
+    WindowMargin = 0 0 0 0
+    PageSpacing = 4 4
+    CbxMangaMode = false
+]
+
+ChmUI [
+    UseFixedPageUI = false
+]
+
+SelectionHandlers [
+]
+
+ExternalViewers [
+]
+
+ZoomLevels = 8.33 12.5 18 25 33.33 50 66.67 75 100 125 150 200 300 400 600 800 1000 1200 1600 2000 2400 3200 4800 6400
+ZoomIncrement = 0
+
+# IMPORTANT: No automatic scaling
+PrinterDefaults [
+    PrintScale = none
+]
+
+ForwardSearch [
+    HighlightOffset = 0
+    HighlightWidth = 15
+    HighlightColor = #6581ff
+    HighlightPermanent = false
+]
+
+Annotations [
+    HighlightColor = #ffff00
+    UnderlineColor = #00ff00
+    SquigglyColor = #ff00ff
+    StrikeOutColor = #ff0000
+    FreeTextSize = 12
+    FreeTextBorderWidth = 1
+]
+
+RememberOpenedFiles = true
+RememberStatePerDocument = true
+RestoreSession = false
+
+UiLanguage = en
+EnableTeXEnhancements = false
+
+DefaultDisplayMode = single page
+DefaultZoom = 100
+
+EscToExit = false
+ReuseInstance = true
+ReloadModifiedDocuments = true
+
+MainWindowBackground = #ffffff
+FullPathInTitle = false
+ShowMenubar = true
+ShowToolbar = true
+ShowFavorites = false
+ShowToc = false
+
+ToolbarSize = 18
+SmoothScroll = false
+ShowStartPage = false
+CheckForUpdates = false
+
+UseTabs = true
+UseSysColors = false
+CustomScreenDPI = 0
+
+FileStates [
+]
+
+SessionData [
+]
+
+TimeOfLastUpdateCheck = 0 0
+OpenCountWeek = 0
