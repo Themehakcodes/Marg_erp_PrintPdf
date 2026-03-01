@@ -1,16 +1,51 @@
+# ============================================================
+#  Marg ERP Auto Printer
+#  Developed by Mehak Singh | TheMehakCodes
+# ============================================================
+#
+#  IMPORTANT — HOW THE WINDOW IS HIDDEN:
+#  1. Built with PyInstaller --windowed  → no console allocated at all
+#  2. As a safety net, the very first thing we do (before ANY import
+#     that might flash a window) is call the Win32 API to hide the
+#     console window if one somehow exists.
+# ============================================================
+
+import ctypes, sys
+
+# ── Hide console window immediately (belt-and-suspenders) ──────────
+def _hide_console():
+    """
+    Works whether the process was launched from Explorer, Task Scheduler,
+    startup folder, or accidentally double-clicked in a terminal.
+    """
+    try:
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)   # SW_HIDE = 0
+            ctypes.windll.kernel32.FreeConsole()        # detach completely
+    except Exception:
+        pass
+
+_hide_console()
+
+# ── Now safe to import everything else ─────────────────────────────
 import os
 import time
 import json
-import sys
 import subprocess
+import threading
+import queue
 import win32print
 import win32api
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 
+import pystray
+from PIL import Image, ImageDraw
+
 # ==============================
-# BASE PATH (WORKS WITH EXE)
+# BASE PATH  (works frozen & raw)
 # ==============================
 
 if getattr(sys, 'frozen', False):
@@ -18,432 +53,593 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+CONFIG_FILE  = os.path.join(BASE_DIR, "config.json")
 SUMATRA_PATH = os.path.join(BASE_DIR, "SumatraPDF.exe")
+ICON_PATH    = os.path.join(BASE_DIR, "logo.ico")
 
 # ==============================
-# TERMINAL COLORS (ANSI)
+# GLOBAL LOG QUEUE  (thread-safe)
 # ==============================
 
-class Color:
-    RESET   = "\033[0m"
-    BOLD    = "\033[1m"
-    DIM     = "\033[2m"
+log_queue  = queue.Queue()
+log_lines  = []              # (level, text)  — full in-memory history
+MAX_LOGS   = 500
 
-    BLACK   = "\033[30m"
-    RED     = "\033[91m"
-    GREEN   = "\033[92m"
-    YELLOW  = "\033[93m"
-    BLUE    = "\033[94m"
-    MAGENTA = "\033[95m"
-    CYAN    = "\033[96m"
-    WHITE   = "\033[97m"
+# ==============================
+# THEME
+# ==============================
 
-    BG_BLACK  = "\033[40m"
-    BG_BLUE   = "\033[44m"
-    BG_GREEN  = "\033[42m"
-    BG_RED    = "\033[41m"
+THEME = {
+    "bg":       "#0F1117",
+    "surface":  "#1A1D27",
+    "surface2": "#22263A",
+    "accent":   "#4F8EF7",
+    "accent2":  "#7C5CF6",
+    "success":  "#2ECC71",
+    "warning":  "#F39C12",
+    "danger":   "#E74C3C",
+    "text":     "#E8ECF4",
+    "text_dim": "#7A8099",
+    "border":   "#2E3450",
+    "input_bg": "#13161F",
+}
 
-def cprint(text, color=Color.WHITE, bold=False, end="\n"):
-    prefix = Color.BOLD if bold else ""
-    print(f"{prefix}{color}{text}{Color.RESET}", end=end)
+FONT_LABEL   = ("Segoe UI", 10)
+FONT_LABEL_SM= ("Segoe UI",  9)
+FONT_MONO    = ("Consolas",  9)
+FONT_BTN     = ("Segoe UI", 10, "bold")
+FONT_CREDIT  = ("Segoe UI",  8, "italic")
+
+LEVEL_COLORS = {
+    "INFO":    "#7ABAFF",
+    "SUCCESS": "#2ECC71",
+    "WARN":    "#F39C12",
+    "ERROR":   "#E74C3C",
+    "PRINT":   "#B388FF",
+    "WATCH":   "#4F8EF7",
+}
+
+# ==============================
+# LOGGER  (thread-safe, no print)
+# ==============================
 
 def log(msg, level="INFO"):
-    now = datetime.now().strftime("%H:%M:%S")
+    now   = datetime.now().strftime("%H:%M:%S")
     icons = {
-        "INFO":    (Color.CYAN,    "ℹ"),
-        "SUCCESS": (Color.GREEN,   "✔"),
-        "WARN":    (Color.YELLOW,  "⚠"),
-        "ERROR":   (Color.RED,     "✖"),
-        "PRINT":   (Color.MAGENTA, "🖨"),
-        "WATCH":   (Color.BLUE,    "👁"),
+        "INFO":    "ℹ",  "SUCCESS": "✔",  "WARN":  "⚠",
+        "ERROR":   "✖",  "PRINT":   "🖨",  "WATCH": "👁",
     }
-    color, icon = icons.get(level, (Color.WHITE, "•"))
-    time_str = f"{Color.DIM}{Color.WHITE}[{now}]{Color.RESET}"
-    level_str = f"{Color.BOLD}{color}[{level}]{Color.RESET}"
-    msg_str = f"{color}{msg}{Color.RESET}"
-    print(f"  {time_str} {level_str} {icon}  {msg_str}")
+    entry = f"[{now}]  {level:<7}  {icons.get(level, '•')}  {msg}"
+    log_lines.append((level, entry))
+    if len(log_lines) > MAX_LOGS:
+        log_lines.pop(0)
+    log_queue.put((level, entry))
+    # intentionally NO print() — we are windowless
 
 # ==============================
 # DEFAULT CONFIG
 # ==============================
 
 DEFAULT_CONFIG = {
-    "printer": "",
-    "watch_folder": os.path.join(os.path.expanduser("~"), "Downloads"),
-    "file_prefix": "Marg_erp",
+    "printer":        "",
+    "watch_folder":   os.path.join(os.path.expanduser("~"), "Downloads"),
+    "file_prefix":    "Marg_erp",
     "check_interval": 3,
-    "silent_mode": True
+    "silent_mode":    True,
 }
 
 # ==============================
-# THEME & STYLES
+# HIDDEN TK ROOT  (keeps Tk alive)
 # ==============================
 
-THEME = {
-    "bg":           "#0F1117",
-    "surface":      "#1A1D27",
-    "surface2":     "#22263A",
-    "accent":       "#4F8EF7",
-    "accent2":      "#7C5CF6",
-    "success":      "#2ECC71",
-    "warning":      "#F39C12",
-    "danger":       "#E74C3C",
-    "text":         "#E8ECF4",
-    "text_dim":     "#7A8099",
-    "border":       "#2E3450",
-    "input_bg":     "#13161F",
-}
+_tk_root: tk.Tk = None   # type: ignore
 
-FONT_HEADING  = ("Segoe UI", 15, "bold")
-FONT_LABEL    = ("Segoe UI", 10)
-FONT_LABEL_SM = ("Segoe UI", 9)
-FONT_MONO     = ("Consolas", 9)
-FONT_BTN      = ("Segoe UI", 10, "bold")
-FONT_CREDIT   = ("Segoe UI", 8, "italic")
+def get_root() -> tk.Tk:
+    global _tk_root
+    if _tk_root is None:
+        _tk_root = tk.Tk()
+        _tk_root.withdraw()                    # invisible, never shown
+        _tk_root.title("MargERPAutoPrinter")
+        if os.path.exists(ICON_PATH):
+            try: _tk_root.iconbitmap(ICON_PATH)
+            except Exception: pass
+    return _tk_root
 
 # ==============================
-# FIRST TIME GUI SETUP
+# ENTRY-STYLE HELPER
 # ==============================
 
-def first_time_setup():
-    config_data = {}
+def _entry_kw():
+    return dict(
+        bg=THEME["input_bg"], fg=THEME["text"],
+        insertbackground=THEME["accent"], relief="flat", bd=0,
+        font=FONT_LABEL, highlightthickness=1,
+        highlightbackground=THEME["border"],
+        highlightcolor=THEME["accent"],
+    )
 
-    root = tk.Tk()
-    root.title("Marg ERP Auto Printer — Setup")
-    root.geometry("520x560")
-    root.resizable(False, False)
-    root.configure(bg=THEME["bg"])
+def _combo_style():
+    s = ttk.Style()
+    s.theme_use("clam")
+    s.configure("Dark.TCombobox",
+        fieldbackground=THEME["input_bg"], background=THEME["input_bg"],
+        foreground=THEME["text"], arrowcolor=THEME["accent"],
+        bordercolor=THEME["border"], lightcolor=THEME["border"],
+        darkcolor=THEME["border"], selectbackground=THEME["accent2"],
+        selectforeground=THEME["text"], padding=6,
+    )
 
-    # ── header ──────────────────────────────────────────────
-    header = tk.Frame(root, bg=THEME["accent2"], height=6)
-    header.pack(fill="x")
+# ==============================
+# FIRST-TIME SETUP WINDOW
+# ==============================
 
-    title_frame = tk.Frame(root, bg=THEME["bg"], pady=20)
-    title_frame.pack(fill="x")
+def first_time_setup() -> dict:
+    result = {}
+    root   = get_root()
 
-    tk.Label(title_frame, text="🖨  Marg ERP Auto Printer",
-             font=("Segoe UI", 16, "bold"),
-             fg=THEME["text"], bg=THEME["bg"]).pack()
+    win = tk.Toplevel(root)
+    win.title("Marg ERP Auto Printer — Setup")
+    win.geometry("520x570")
+    win.resizable(False, False)
+    win.configure(bg=THEME["bg"])
+    win.grab_set()
+    if os.path.exists(ICON_PATH):
+        try: win.iconbitmap(ICON_PATH)
+        except Exception: pass
 
-    tk.Label(title_frame, text="Initial Configuration",
+    # header accent bar
+    tk.Frame(win, bg=THEME["accent2"], height=6).pack(fill="x")
+    hdr = tk.Frame(win, bg=THEME["bg"], pady=18); hdr.pack(fill="x")
+    tk.Label(hdr, text="🖨  Marg ERP Auto Printer",
+             font=("Segoe UI", 16, "bold"), fg=THEME["text"], bg=THEME["bg"]).pack()
+    tk.Label(hdr, text="Initial Configuration",
              font=FONT_LABEL_SM, fg=THEME["text_dim"], bg=THEME["bg"]).pack()
+    tk.Frame(win, bg=THEME["border"], height=1).pack(fill="x", padx=30)
 
-    # ── divider ──────────────────────────────────────────────
-    tk.Frame(root, bg=THEME["border"], height=1).pack(fill="x", padx=30)
-
-    # ── form ─────────────────────────────────────────────────
-    form = tk.Frame(root, bg=THEME["bg"], padx=30, pady=10)
+    form = tk.Frame(win, bg=THEME["bg"], padx=30, pady=8)
     form.pack(fill="both", expand=True)
 
-    def field_label(parent, text):
-        tk.Label(parent, text=text, font=FONT_LABEL,
-                 fg=THEME["text_dim"], bg=THEME["bg"],
-                 anchor="w").pack(fill="x", pady=(12, 2))
-
-    entry_style = dict(
-        bg=THEME["input_bg"], fg=THEME["text"],
-        insertbackground=THEME["accent"],
-        relief="flat", bd=0,
-        font=FONT_LABEL,
-        highlightthickness=1,
-        highlightbackground=THEME["border"],
-        highlightcolor=THEME["accent"]
-    )
+    def lbl(parent, text):
+        tk.Label(parent, text=text, font=FONT_LABEL, fg=THEME["text_dim"],
+                 bg=THEME["bg"], anchor="w").pack(fill="x", pady=(10, 2))
 
     # Printer
-    field_label(form, "🖨  Printer")
-    printers = [p[2] for p in win32print.EnumPrinters(2)]
+    lbl(form, "🖨  Printer")
+    printers    = [p[2] for p in win32print.EnumPrinters(2)]
     printer_var = tk.StringVar(value=printers[0] if printers else "")
-
-    style = ttk.Style()
-    style.theme_use("clam")
-    style.configure("Dark.TCombobox",
-        fieldbackground=THEME["input_bg"],
-        background=THEME["input_bg"],
-        foreground=THEME["text"],
-        arrowcolor=THEME["accent"],
-        bordercolor=THEME["border"],
-        lightcolor=THEME["border"],
-        darkcolor=THEME["border"],
-        selectbackground=THEME["accent2"],
-        selectforeground=THEME["text"],
-        padding=6
-    )
+    _combo_style()
     ttk.Combobox(form, textvariable=printer_var, values=printers,
                  style="Dark.TCombobox", state="readonly").pack(fill="x")
 
-    # Watch Folder
-    field_label(form, "📁  Watch Folder")
+    # Watch folder
+    lbl(form, "📁  Watch Folder")
     folder_var = tk.StringVar(value=DEFAULT_CONFIG["watch_folder"])
-    folder_row = tk.Frame(form, bg=THEME["bg"])
-    folder_row.pack(fill="x")
+    fr = tk.Frame(form, bg=THEME["bg"]); fr.pack(fill="x")
+    tk.Entry(fr, textvariable=folder_var, **_entry_kw()).pack(
+        side="left", fill="x", expand=True, ipady=6)
+    tk.Button(fr, text=" Browse ",
+              command=lambda: folder_var.set(filedialog.askdirectory() or folder_var.get()),
+              bg=THEME["surface2"], fg=THEME["accent"], relief="flat",
+              font=FONT_LABEL, cursor="hand2", bd=0,
+              activebackground=THEME["accent"], activeforeground=THEME["bg"],
+              padx=10, pady=6).pack(side="left", padx=(6,0))
 
-    folder_entry = tk.Entry(folder_row, textvariable=folder_var, **entry_style)
-    folder_entry.pack(side="left", fill="x", expand=True, ipady=6)
-
-    def browse_folder():
-        path = filedialog.askdirectory()
-        if path:
-            folder_var.set(path)
-
-    browse_btn = tk.Button(
-        folder_row, text=" Browse ",
-        command=browse_folder,
-        bg=THEME["surface2"], fg=THEME["accent"],
-        relief="flat", font=FONT_LABEL,
-        cursor="hand2", bd=0,
-        activebackground=THEME["accent"], activeforeground=THEME["bg"],
-        padx=10, pady=6
-    )
-    browse_btn.pack(side="left", padx=(6, 0))
-
-    # Row: prefix + interval
-    row2 = tk.Frame(form, bg=THEME["bg"])
-    row2.pack(fill="x")
-
-    left_col = tk.Frame(row2, bg=THEME["bg"])
-    left_col.pack(side="left", fill="x", expand=True, padx=(0, 10))
-
-    right_col = tk.Frame(row2, bg=THEME["bg"])
-    right_col.pack(side="left", fill="x", expand=True)
-
-    field_label(left_col, "🏷  File Prefix")
+    # Prefix + interval
+    row = tk.Frame(form, bg=THEME["bg"]); row.pack(fill="x")
+    lc  = tk.Frame(row,  bg=THEME["bg"]); lc.pack(side="left", fill="x", expand=True, padx=(0,10))
+    rc  = tk.Frame(row,  bg=THEME["bg"]); rc.pack(side="left", fill="x", expand=True)
+    lbl(lc, "🏷  File Prefix")
     prefix_var = tk.StringVar(value=DEFAULT_CONFIG["file_prefix"])
-    tk.Entry(left_col, textvariable=prefix_var, **entry_style).pack(fill="x", ipady=6)
-
-    field_label(right_col, "⏱  Check Interval (sec)")
+    tk.Entry(lc, textvariable=prefix_var, **_entry_kw()).pack(fill="x", ipady=6)
+    lbl(rc, "⏱  Interval (sec)")
     interval_var = tk.StringVar(value=str(DEFAULT_CONFIG["check_interval"]))
-    tk.Entry(right_col, textvariable=interval_var, **entry_style).pack(fill="x", ipady=6)
+    tk.Entry(rc, textvariable=interval_var, **_entry_kw()).pack(fill="x", ipady=6)
 
-    # Silent mode toggle
+    # Silent mode
     silent_var = tk.BooleanVar(value=True)
-    toggle_frame = tk.Frame(form, bg=THEME["bg"])
-    toggle_frame.pack(fill="x", pady=(16, 0))
-
-    def toggle_silent():
-        if silent_var.get():
-            toggle_indicator.config(bg=THEME["success"], text="ON ")
-        else:
-            toggle_indicator.config(bg=THEME["text_dim"], text="OFF")
-
-    tk.Label(toggle_frame, text="🔇  Silent Print Mode",
+    sf = tk.Frame(form, bg=THEME["bg"]); sf.pack(fill="x", pady=(14,0))
+    tk.Label(sf, text="🔇  Silent Print Mode",
              font=FONT_LABEL, fg=THEME["text"], bg=THEME["bg"]).pack(side="left")
+    ind = tk.Label(sf, text="ON ", bg=THEME["success"], fg=THEME["bg"],
+                   font=("Segoe UI", 8, "bold"), padx=6, pady=2)
+    ind.pack(side="right")
+    def _tog():
+        ind.config(bg=THEME["success"] if silent_var.get() else THEME["text_dim"],
+                   text="ON " if silent_var.get() else "OFF")
+    tk.Checkbutton(sf, variable=silent_var, command=_tog,
+                   bg=THEME["bg"], selectcolor=THEME["surface2"],
+                   relief="flat", bd=0, activebackground=THEME["bg"]).pack(side="right", padx=4)
 
-    toggle_indicator = tk.Label(
-        toggle_frame, text="ON ",
-        bg=THEME["success"], fg=THEME["bg"],
-        font=("Segoe UI", 8, "bold"), padx=6, pady=2
-    )
-    toggle_indicator.pack(side="right")
+    tk.Frame(win, bg=THEME["border"], height=1).pack(fill="x", padx=30)
 
-    tk.Checkbutton(
-        toggle_frame, variable=silent_var,
-        command=toggle_silent,
-        bg=THEME["bg"], fg=THEME["text"],
-        activebackground=THEME["bg"],
-        selectcolor=THEME["surface2"],
-        relief="flat", bd=0
-    ).pack(side="right", padx=4)
-
-    # ── save button ───────────────────────────────────────────
-    tk.Frame(root, bg=THEME["border"], height=1).pack(fill="x", padx=30)
-
-    btn_frame = tk.Frame(root, bg=THEME["bg"], pady=16)
-    btn_frame.pack()
-
-    def save_config():
+    def _save():
         try:
-            selected_printer = printer_var.get()
-            watch_folder     = folder_var.get()
-            file_prefix      = prefix_var.get()
-            silent_mode      = silent_var.get()
-            check_interval   = int(interval_var.get())
-
-            if not selected_printer:
-                messagebox.showerror("Error", "Please select a printer.", parent=root)
-                return
-
-            config_data.update({
-                "printer":        selected_printer,
-                "watch_folder":   watch_folder,
-                "file_prefix":    file_prefix,
-                "check_interval": check_interval,
-                "silent_mode":    silent_mode
+            if not printer_var.get():
+                messagebox.showerror("Error", "Please select a printer.", parent=win); return
+            result.update({
+                "printer":        printer_var.get(),
+                "watch_folder":   folder_var.get(),
+                "file_prefix":    prefix_var.get(),
+                "check_interval": int(interval_var.get()),
+                "silent_mode":    silent_var.get(),
             })
-
             with open(CONFIG_FILE, "w") as f:
-                json.dump(config_data, f, indent=4)
-
-            messagebox.showinfo("Saved", "✔  Configuration saved successfully!", parent=root)
-            root.destroy()
-
+                json.dump(result, f, indent=4)
+            messagebox.showinfo("Saved", "✔  Configuration saved!", parent=win)
+            win.destroy()
         except Exception as e:
-            messagebox.showerror("Error", str(e), parent=root)
+            messagebox.showerror("Error", str(e), parent=win)
 
-    save_btn = tk.Button(
-        btn_frame, text="  Save Configuration  ",
-        command=save_config,
-        bg=THEME["accent"], fg=THEME["bg"],
-        font=FONT_BTN, relief="flat", bd=0,
-        cursor="hand2", padx=20, pady=10,
-        activebackground=THEME["accent2"],
-        activeforeground=THEME["text"]
-    )
-    save_btn.pack()
+    bf = tk.Frame(win, bg=THEME["bg"], pady=14); bf.pack()
+    tk.Button(bf, text="  Save Configuration  ", command=_save,
+              bg=THEME["accent"], fg=THEME["bg"], font=FONT_BTN,
+              relief="flat", bd=0, cursor="hand2", padx=20, pady=10,
+              activebackground=THEME["accent2"], activeforeground=THEME["text"]).pack()
 
-    # ── footer credit ─────────────────────────────────────────
-    tk.Label(root,
-             text="Developed by Mehak Singh",
-             font=FONT_CREDIT,
-             fg=THEME["text_dim"], bg=THEME["bg"]).pack(pady=(0, 10))
+    tk.Label(win, text="Developed by Mehak Singh | TheMehakCodes",
+             font=FONT_CREDIT, fg=THEME["text_dim"], bg=THEME["bg"]).pack(pady=(0,10))
 
-    root.mainloop()
-    return config_data
-
+    win.wait_window()   # block until closed
+    return result
 
 # ==============================
 # LOAD CONFIG
 # ==============================
 
-def load_config():
-    if "--config" in sys.argv:
+def load_config() -> dict:
+    if "--config" in sys.argv or not os.path.exists(CONFIG_FILE):
         return first_time_setup()
-
-    if not os.path.exists(CONFIG_FILE):
-        return first_time_setup()
-
     try:
         with open(CONFIG_FILE, "r") as f:
             return json.load(f)
-    except:
+    except Exception:
         return first_time_setup()
 
-
-CONFIG = load_config()
-
-SELECTED_PRINTER = CONFIG["printer"]
-WATCH_FOLDER     = CONFIG["watch_folder"]
-FILE_PREFIX      = CONFIG["file_prefix"]
-CHECK_INTERVAL   = CONFIG["check_interval"]
-USE_SILENT_MODE  = CONFIG["silent_mode"]
+# ── load (may open setup window) ───────────────────────────────────
+_root_ready = get_root()          # create hidden root FIRST
+CONFIG           = load_config()
+SELECTED_PRINTER = CONFIG.get("printer",        DEFAULT_CONFIG["printer"])
+WATCH_FOLDER     = CONFIG.get("watch_folder",   DEFAULT_CONFIG["watch_folder"])
+FILE_PREFIX      = CONFIG.get("file_prefix",    DEFAULT_CONFIG["file_prefix"])
+CHECK_INTERVAL   = CONFIG.get("check_interval", DEFAULT_CONFIG["check_interval"])
+USE_SILENT_MODE  = CONFIG.get("silent_mode",    DEFAULT_CONFIG["silent_mode"])
 
 # ==============================
 # PRINT FUNCTIONS
 # ==============================
 
-def print_pdf_legacy(file_path):
+def print_pdf_legacy(fp: str):
     try:
         win32print.SetDefaultPrinter(SELECTED_PRINTER)
-        win32api.ShellExecute(0, "print", file_path, None, ".", 0)
+        win32api.ShellExecute(0, "print", fp, None, ".", 0)
         time.sleep(5)
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        if os.path.exists(fp): os.remove(fp)
     except Exception as e:
         log(f"Legacy print error: {e}", "ERROR")
 
-
-def print_pdf_silent(file_path):
+def print_pdf_silent(fp: str):
     try:
         if not os.path.exists(SUMATRA_PATH):
-            log("SumatraPDF not found — falling back to legacy mode.", "WARN")
-            print_pdf_legacy(file_path)
-            return
-
+            log("SumatraPDF not found — legacy fallback", "WARN")
+            print_pdf_legacy(fp); return
         subprocess.Popen(
-            [SUMATRA_PATH, "-print-to", SELECTED_PRINTER, "-silent", "-exit-on-print", file_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            [SUMATRA_PATH, "-print-to", SELECTED_PRINTER,
+             "-silent", "-exit-on-print", fp],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
-
         time.sleep(3)
-
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
+        if os.path.exists(fp): os.remove(fp)
     except Exception as e:
         log(f"Silent print error: {e}", "ERROR")
-        print_pdf_legacy(file_path)
+        print_pdf_legacy(fp)
 
-
-def print_pdf(file_path):
-    filename = os.path.basename(file_path)
-    log(f"Sending to printer → {filename}", "PRINT")
-
-    if USE_SILENT_MODE:
-        print_pdf_silent(file_path)
-    else:
-        print_pdf_legacy(file_path)
-
-    log(f"Done — {filename}", "SUCCESS")
-
+def print_pdf(fp: str):
+    name = os.path.basename(fp)
+    log(f"Sending → {name}", "PRINT")
+    print_pdf_silent(fp) if USE_SILENT_MODE else print_pdf_legacy(fp)
+    log(f"Done — {name}", "SUCCESS")
 
 # ==============================
-# FILE DETECTION
+# FILE WATCHER
 # ==============================
 
 def get_marg_files():
     if not os.path.exists(WATCH_FOLDER):
-        log(f"Watch folder not found: {WATCH_FOLDER}", "ERROR")
-        return []
-
+        log(f"Watch folder missing: {WATCH_FOLDER}", "ERROR"); return []
     files = [
         os.path.join(WATCH_FOLDER, f)
         for f in os.listdir(WATCH_FOLDER)
         if f.startswith(FILE_PREFIX) and f.lower().endswith(".pdf")
     ]
-    files.sort(key=lambda x: os.path.getctime(x))
+    files.sort(key=os.path.getctime)
     return files
 
+stop_event = threading.Event()
+
+def watcher_loop():
+    log("Auto Printer started — watching for PDFs…", "WATCH")
+    log(f"Printer : {SELECTED_PRINTER}", "INFO")
+    log(f"Folder  : {WATCH_FOLDER}",     "INFO")
+    log(f"Prefix  : {FILE_PREFIX}",      "INFO")
+    while not stop_event.is_set():
+        for fp in get_marg_files():
+            if stop_event.is_set(): break
+            time.sleep(2)
+            print_pdf(fp)
+        stop_event.wait(CHECK_INTERVAL)
 
 # ==============================
-# STARTUP BANNER
+# LOG WINDOW
 # ==============================
 
-os.system("color")  # enable ANSI on Windows CMD
+_log_win_open = False
 
-banner_lines = [
-    "",
-    f"  {Color.BOLD}{Color.CYAN}╔══════════════════════════════════════════════╗{Color.RESET}",
-    f"  {Color.BOLD}{Color.CYAN}║   🖨  Marg ERP Auto Printer                  ║{Color.RESET}",
-    f"  {Color.BOLD}{Color.CYAN}╚══════════════════════════════════════════════╝{Color.RESET}",
-    "",
-]
-for line in banner_lines:
-    print(line)
+def open_log_window():
+    """Called on main Tk thread via root.after()"""
+    global _log_win_open
+    if _log_win_open:
+        return
+    _log_win_open = True
 
-cprint(f"  {'Developed by':<16}", Color.DIM, end="")
-cprint("Mehak Singh", Color.MAGENTA, bold=True)
-print()
+    root = get_root()
+    win  = tk.Toplevel(root)
+    win.title("Marg ERP Auto Printer — Live Logs")
+    win.geometry("820x500")
+    win.configure(bg=THEME["bg"])
+    if os.path.exists(ICON_PATH):
+        try: win.iconbitmap(ICON_PATH)
+        except Exception: pass
 
-info_rows = [
-    ("Printer",        SELECTED_PRINTER, Color.CYAN),
-    ("Watch Folder",   WATCH_FOLDER,     Color.BLUE),
-    ("File Prefix",    FILE_PREFIX,      Color.YELLOW),
-    ("Check Interval", f"{CHECK_INTERVAL}s", Color.GREEN),
-    ("Silent Mode",    "ON" if USE_SILENT_MODE else "OFF",
-                       Color.GREEN if USE_SILENT_MODE else Color.RED),
-]
+    def _on_close():
+        global _log_win_open
+        _log_win_open = False
+        win.destroy()
+    win.protocol("WM_DELETE_WINDOW", _on_close)
 
-cprint(f"  {'─'*44}", Color.DIM)
-for label, value, vc in info_rows:
-    cprint(f"  {Color.DIM}{label:<18}{Color.RESET}  {vc}{Color.BOLD}{value}{Color.RESET}")
-cprint(f"  {'─'*44}", Color.DIM)
-print()
+    # header
+    tk.Frame(win, bg=THEME["accent2"], height=5).pack(fill="x")
+    hdr = tk.Frame(win, bg=THEME["surface"], pady=8); hdr.pack(fill="x")
+    tk.Label(hdr, text="🖨  Marg ERP Auto Printer  —  Live Logs",
+             font=("Segoe UI", 11, "bold"), fg=THEME["text"],
+             bg=THEME["surface"]).pack(side="left", padx=16)
+    tk.Label(hdr, text="● RUNNING", font=("Segoe UI", 9, "bold"),
+             fg=THEME["success"], bg=THEME["surface"]).pack(side="right", padx=16)
 
-log("Auto Printer is running. Watching for new files...", "WATCH")
-print()
+    # info strip
+    info = tk.Frame(win, bg=THEME["surface2"], pady=4); info.pack(fill="x")
+    tk.Label(info,
+             text=(f"  Printer: {SELECTED_PRINTER}   │   Folder: {WATCH_FOLDER}"
+                   f"   │   Prefix: {FILE_PREFIX}   │   "
+                   f"Interval: {CHECK_INTERVAL}s   │   "
+                   f"Silent: {'ON' if USE_SILENT_MODE else 'OFF'}"),
+             font=("Consolas", 8), fg=THEME["text_dim"],
+             bg=THEME["surface2"], anchor="w").pack(fill="x", padx=12)
+
+    # text widget
+    tf = tk.Frame(win, bg=THEME["bg"]); tf.pack(fill="both", expand=True, padx=8, pady=8)
+    sb = tk.Scrollbar(tf, bg=THEME["surface2"], troughcolor=THEME["bg"],
+                      activebackground=THEME["accent"])
+    sb.pack(side="right", fill="y")
+    txt = tk.Text(tf, bg=THEME["bg"], fg=THEME["text"], font=FONT_MONO,
+                  relief="flat", bd=0, state="disabled", wrap="word",
+                  yscrollcommand=sb.set, selectbackground=THEME["accent2"],
+                  pady=4, padx=8)
+    txt.pack(fill="both", expand=True)
+    sb.config(command=txt.yview)
+    for lvl, col in LEVEL_COLORS.items():
+        txt.tag_config(lvl, foreground=col)
+
+    def _append(level, entry):
+        txt.config(state="normal")
+        txt.insert("end", entry + "\n", level if level in LEVEL_COLORS else "INFO")
+        txt.config(state="disabled")
+        txt.see("end")
+
+    # replay history
+    for lvl, entry in log_lines:
+        _append(lvl, entry)
+
+    # toolbar
+    bb = tk.Frame(win, bg=THEME["surface"], pady=8); bb.pack(fill="x")
+    bkw = dict(bg=THEME["surface2"], fg=THEME["accent"], font=("Segoe UI", 9),
+               relief="flat", bd=0, cursor="hand2", padx=12, pady=5,
+               activebackground=THEME["accent"], activeforeground=THEME["bg"])
+
+    def _clear():
+        log_lines.clear()
+        txt.config(state="normal"); txt.delete("1.0","end"); txt.config(state="disabled")
+
+    def _copy():
+        win.clipboard_clear(); win.clipboard_append(txt.get("1.0","end"))
+        messagebox.showinfo("Copied", "Log copied to clipboard.", parent=win)
+
+    tk.Button(bb, text="🗑  Clear",  command=_clear,    **bkw).pack(side="left",  padx=(12,4))
+    tk.Button(bb, text="📋  Copy",   command=_copy,     **bkw).pack(side="left",  padx=4)
+    tk.Button(bb, text="✖  Close",  command=_on_close, **bkw).pack(side="right", padx=12)
+    tk.Label(bb, text="Developed by Mehak Singh | TheMehakCodes",
+             font=FONT_CREDIT, fg=THEME["text_dim"], bg=THEME["surface"]).pack(side="right", padx=16)
+
+    # poll queue for new entries
+    def _poll():
+        if not _log_win_open: return
+        try:
+            while True:
+                lvl, entry = log_queue.get_nowait()
+                _append(lvl, entry)
+        except queue.Empty:
+            pass
+        win.after(300, _poll)
+    _poll()
 
 # ==============================
-# MAIN LOOP
+# CONFIG EDIT WINDOW
 # ==============================
 
-while True:
-    marg_files = get_marg_files()
+def open_config_window():
+    root = get_root()
+    win  = tk.Toplevel(root)
+    win.title("Edit Configuration")
+    win.geometry("520x560")
+    win.configure(bg=THEME["bg"])
+    if os.path.exists(ICON_PATH):
+        try: win.iconbitmap(ICON_PATH)
+        except Exception: pass
 
-    for file_path in marg_files:
-        time.sleep(2)
-        print_pdf(file_path)
+    tk.Frame(win, bg=THEME["accent2"], height=6).pack(fill="x")
+    hdr = tk.Frame(win, bg=THEME["bg"], pady=14); hdr.pack(fill="x")
+    tk.Label(hdr, text="⚙️  Edit Configuration",
+             font=("Segoe UI", 14, "bold"), fg=THEME["text"], bg=THEME["bg"]).pack()
+    tk.Frame(win, bg=THEME["border"], height=1).pack(fill="x", padx=30)
 
-    time.sleep(CHECK_INTERVAL)
+    form = tk.Frame(win, bg=THEME["bg"], padx=30, pady=10); form.pack(fill="both", expand=True)
+
+    def lbl(text):
+        tk.Label(form, text=text, font=FONT_LABEL, fg=THEME["text_dim"],
+                 bg=THEME["bg"], anchor="w").pack(fill="x", pady=(10,2))
+
+    lbl("🖨  Printer")
+    printers    = [p[2] for p in win32print.EnumPrinters(2)]
+    printer_var = tk.StringVar(value=SELECTED_PRINTER)
+    _combo_style()
+    ttk.Combobox(form, textvariable=printer_var, values=printers,
+                 style="Dark.TCombobox", state="readonly").pack(fill="x")
+
+    lbl("📁  Watch Folder")
+    folder_var = tk.StringVar(value=WATCH_FOLDER)
+    fr = tk.Frame(form, bg=THEME["bg"]); fr.pack(fill="x")
+    tk.Entry(fr, textvariable=folder_var, **_entry_kw()).pack(
+        side="left", fill="x", expand=True, ipady=6)
+    tk.Button(fr, text=" Browse ",
+              command=lambda: folder_var.set(filedialog.askdirectory() or folder_var.get()),
+              bg=THEME["surface2"], fg=THEME["accent"], relief="flat",
+              font=FONT_LABEL, cursor="hand2", bd=0,
+              activebackground=THEME["accent"], activeforeground=THEME["bg"],
+              padx=10, pady=6).pack(side="left", padx=(6,0))
+
+    lbl("🏷  File Prefix")
+    prefix_var = tk.StringVar(value=FILE_PREFIX)
+    tk.Entry(form, textvariable=prefix_var, **_entry_kw()).pack(fill="x", ipady=6)
+
+    lbl("⏱  Check Interval (sec)")
+    interval_var = tk.StringVar(value=str(CHECK_INTERVAL))
+    tk.Entry(form, textvariable=interval_var, **_entry_kw()).pack(fill="x", ipady=6)
+
+    silent_var = tk.BooleanVar(value=USE_SILENT_MODE)
+    sf = tk.Frame(form, bg=THEME["bg"]); sf.pack(fill="x", pady=(14,0))
+    tk.Label(sf, text="🔇  Silent Mode", font=FONT_LABEL,
+             fg=THEME["text"], bg=THEME["bg"]).pack(side="left")
+    tk.Checkbutton(sf, variable=silent_var, bg=THEME["bg"],
+                   selectcolor=THEME["surface2"], relief="flat", bd=0,
+                   activebackground=THEME["bg"]).pack(side="right")
+
+    def _save():
+        try:
+            cfg = {
+                "printer":        printer_var.get(),
+                "watch_folder":   folder_var.get(),
+                "file_prefix":    prefix_var.get(),
+                "check_interval": int(interval_var.get()),
+                "silent_mode":    silent_var.get(),
+            }
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(cfg, f, indent=4)
+            log("Config saved — restart app to apply changes.", "WARN")
+            messagebox.showinfo("Saved",
+                "✔ Config saved.\nRestart the app for changes to take effect.",
+                parent=win)
+            win.destroy()
+        except Exception as e:
+            messagebox.showerror("Error", str(e), parent=win)
+
+    tk.Frame(win, bg=THEME["border"], height=1).pack(fill="x", padx=30)
+    bf = tk.Frame(win, bg=THEME["bg"], pady=14); bf.pack()
+    tk.Button(bf, text="  Save  ", command=_save,
+              bg=THEME["accent"], fg=THEME["bg"], font=FONT_BTN,
+              relief="flat", bd=0, cursor="hand2",
+              padx=18, pady=8,
+              activebackground=THEME["accent2"],
+              activeforeground=THEME["text"]).pack()
+    tk.Label(win, text="Developed by Mehak Singh | TheMehakCodes",
+             font=FONT_CREDIT, fg=THEME["text_dim"], bg=THEME["bg"]).pack(pady=(0,10))
+
+# ==============================
+# SYSTEM TRAY ICON
+# ==============================
+
+def _make_tray_image() -> Image.Image:
+    if os.path.exists(ICON_PATH):
+        try:
+            return Image.open(ICON_PATH).convert("RGBA").resize((64, 64))
+        except Exception:
+            pass
+    # fallback — draw a coloured circle with "M"
+    img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([2, 2, 62, 62], fill="#4F8EF7")
+    draw.text((20, 18), "M", fill="white")
+    return img
+
+# Tray callbacks must be plain functions (pystray calls them from its thread).
+# We schedule Tk work onto the main thread via root.after().
+
+def _tray_show_logs(icon, item):
+    get_root().after(0, open_log_window)
+
+def _tray_edit_config(icon, item):
+    get_root().after(0, open_config_window)
+
+def _tray_exit(icon, item):
+    log("Shutting down…", "WARN")
+    stop_event.set()
+    icon.stop()
+    get_root().after(0, get_root().destroy)
+
+def build_tray() -> pystray.Icon:
+    menu = pystray.Menu(
+        pystray.MenuItem(
+            "🖨  Marg ERP Auto Printer",
+            None,
+            enabled=False,
+        ),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            "📋  Show Logs",
+            _tray_show_logs,
+            default=True,       # ← double-click opens logs
+        ),
+        pystray.MenuItem(
+            "⚙️   Edit Config",
+            _tray_edit_config,
+        ),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            "✖  Exit",
+            _tray_exit,
+        ),
+    )
+    return pystray.Icon(
+        name  = "MargERPAutoPrinter",
+        icon  = _make_tray_image(),
+        title = "Marg ERP Auto Printer",
+        menu  = menu,
+    )
+
+# ==============================
+# MAIN
+# ==============================
+
+def main():
+    # 1 — start file watcher (daemon thread)
+    threading.Thread(target=watcher_loop, daemon=True, name="Watcher").start()
+
+    # 2 — start tray icon (daemon thread — pystray has its own loop)
+    tray = build_tray()
+    threading.Thread(target=tray.run, daemon=True, name="Tray").start()
+
+    # 3 — Tk event loop on main thread (required by Windows)
+    #     This keeps the process alive and handles all GUI callbacks.
+    get_root().mainloop()
+
+if __name__ == "__main__":
+    main()
