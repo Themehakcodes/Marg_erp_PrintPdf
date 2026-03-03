@@ -488,6 +488,63 @@ def print_pdf(fp: str):
     log(f"Done — {name}", "SUCCESS")
 
 # ==============================
+# PRINT QUEUE  (guaranteed ordered, no missed files)
+# ==============================
+#
+#  How it works:
+#  • A dedicated daemon thread (`print_worker`) blocks on `_print_queue`.
+#  • The watcher puts file-paths into `_print_queue` one by one.
+#  • `_queued_files` is a set that tracks what has already been enqueued
+#    so the watcher never adds the same file twice.
+#  • Files are sorted by creation-time before being enqueued, so even if
+#    multiple PDFs arrive in the same scan cycle they go in the right order.
+#  • The worker processes one file at a time — the next job only starts
+#    after the previous print_pdf() call has fully returned, guaranteeing
+#    nothing is skipped or overlapped.
+# ==============================
+
+_print_queue   = queue.Queue()   # holds absolute file paths
+_queued_files  = set()           # paths already enqueued (guard against duplicates)
+_queued_lock   = threading.Lock()
+
+
+def _enqueue_file(fp: str):
+    """Thread-safe: add a file to the print queue only once."""
+    with _queued_lock:
+        if fp not in _queued_files:
+            _queued_files.add(fp)
+            _print_queue.put(fp)
+            log(f"Queued  → {os.path.basename(fp)}  "
+                f"(queue depth: {_print_queue.qsize()})", "WATCH")
+
+
+def print_worker():
+    """
+    Dedicated worker thread.
+    Blocks waiting for jobs, prints them strictly one-at-a-time in FIFO order.
+    Removes the path from _queued_files after the file has been processed
+    so a re-appeared file (edge case) can be re-queued.
+    """
+    log("Print worker started — ready for jobs.", "INFO")
+    while not stop_event.is_set():
+        try:
+            fp = _print_queue.get(timeout=1)   # 1 s timeout so we can check stop_event
+        except queue.Empty:
+            continue
+
+        try:
+            if os.path.exists(fp):
+                print_pdf(fp)
+            else:
+                log(f"File gone before printing: {os.path.basename(fp)}", "WARN")
+        except Exception as e:
+            log(f"Print worker error ({os.path.basename(fp)}): {e}", "ERROR")
+        finally:
+            with _queued_lock:
+                _queued_files.discard(fp)
+            _print_queue.task_done()
+
+# ==============================
 # FILE WATCHER
 # ==============================
 
@@ -499,7 +556,7 @@ def get_marg_files():
         for f in os.listdir(WATCH_FOLDER)
         if f.startswith(FILE_PREFIX) and f.lower().endswith(".pdf")
     ]
-    files.sort(key=os.path.getctime)
+    files.sort(key=os.path.getctime)   # oldest first — preserves print order
     return files
 
 stop_event = threading.Event()
@@ -512,9 +569,9 @@ def watcher_loop():
     log(f"Version : v{APP_VERSION}",     "INFO")
     while not stop_event.is_set():
         for fp in get_marg_files():
-            if stop_event.is_set(): break
-            time.sleep(2)
-            print_pdf(fp)
+            if stop_event.is_set():
+                break
+            _enqueue_file(fp)          # hand off to the print queue worker
         stop_event.wait(CHECK_INTERVAL)
 
 # ==============================
@@ -864,14 +921,17 @@ def main():
     # 0 — silent background update check on startup
     start_update_check(silent=True)
 
-    # 1 — start file watcher (daemon thread)
+    # 1 — start dedicated print-queue worker (daemon thread)
+    threading.Thread(target=print_worker, daemon=True, name="PrintWorker").start()
+
+    # 2 — start file watcher (daemon thread)
     threading.Thread(target=watcher_loop, daemon=True, name="Watcher").start()
 
-    # 2 — start tray icon (daemon thread)
+    # 3 — start tray icon (daemon thread)
     tray = build_tray()
     threading.Thread(target=tray.run, daemon=True, name="Tray").start()
 
-    # 3 — Tk event loop on main thread (required by Windows)
+    # 4 — Tk event loop on main thread (required by Windows)
     get_root().mainloop()
 
 if __name__ == "__main__":
