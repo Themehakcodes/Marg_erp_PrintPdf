@@ -1,6 +1,7 @@
 # ============================================================
 #  Marg ERP Auto Printer
 #  Developed by Mehak Singh | TheMehakCodes
+#  Version: 2.0.0
 # ============================================================
 #
 #  IMPORTANT — HOW THE WINDOW IS HIDDEN:
@@ -40,9 +41,26 @@ import win32api
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
+import urllib.request
+import urllib.error
+import ssl
+import hashlib
+import tempfile
+import shutil
 
 import pystray
 from PIL import Image, ImageDraw
+
+# ==============================
+# VERSION INFORMATION
+# ==============================
+
+APP_VERSION = "2.0.0"
+APP_NAME = "Marg ERP Auto Printer"
+GITHUB_REPO = "Themehakcodes/Marg_erp_PrintPdf"  # Your actual GitHub repo
+VERSION_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/version.txt"
+EXE_URL = f"https://github.com/{GITHUB_REPO}/releases/latest/download/marg_auto_printer.exe"
+UPDATER_URL = f"https://github.com/{GITHUB_REPO}/releases/latest/download/updater.exe"
 
 # ==============================
 # BASE PATH  (works frozen & raw)
@@ -50,12 +68,16 @@ from PIL import Image, ImageDraw
 
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
+    IS_FROZEN = True
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    IS_FROZEN = False
 
 CONFIG_FILE  = os.path.join(BASE_DIR, "config.json")
 SUMATRA_PATH = os.path.join(BASE_DIR, "SumatraPDF.exe")
 ICON_PATH    = os.path.join(BASE_DIR, "logo.ico")
+UPDATER_PATH = os.path.join(BASE_DIR, "updater.exe")
+VERSION_FILE = os.path.join(BASE_DIR, "version.txt")
 
 # ==============================
 # GLOBAL LOG QUEUE  (thread-safe)
@@ -97,6 +119,7 @@ LEVEL_COLORS = {
     "ERROR":   "#E74C3C",
     "PRINT":   "#B388FF",
     "WATCH":   "#4F8EF7",
+    "UPDATE":  "#FFA500",
 }
 
 # ==============================
@@ -108,13 +131,241 @@ def log(msg, level="INFO"):
     icons = {
         "INFO":    "ℹ",  "SUCCESS": "✔",  "WARN":  "⚠",
         "ERROR":   "✖",  "PRINT":   "🖨",  "WATCH": "👁",
+        "UPDATE":  "⬆",
     }
     entry = f"[{now}]  {level:<7}  {icons.get(level, '•')}  {msg}"
     log_lines.append((level, entry))
     if len(log_lines) > MAX_LOGS:
         log_lines.pop(0)
     log_queue.put((level, entry))
-    # intentionally NO print() — we are windowless
+
+# ==============================
+# AUTO-UPDATE FUNCTIONS
+# ==============================
+
+def get_current_version():
+    """Get current version from local file or constant"""
+    if os.path.exists(VERSION_FILE):
+        try:
+            with open(VERSION_FILE, 'r') as f:
+                return f.read().strip()
+        except:
+            pass
+    return APP_VERSION
+
+def check_for_updates():
+    """
+    Check GitHub for newer version
+    Returns latest version if available, None if no update
+    """
+    if not IS_FROZEN:
+        log("Skipping update check (development mode)", "INFO")
+        return None
+    
+    try:
+        log("Checking for updates...", "INFO")
+        
+        # Create SSL context that doesn't verify (for corporate networks)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        req = urllib.request.Request(
+            VERSION_URL,
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        
+        with urllib.request.urlopen(req, timeout=5, context=ctx) as response:
+            latest_version = response.read().decode('utf-8').strip()
+        
+        current = get_current_version()
+        
+        log(f"Current version: {current}, Latest: {latest_version}", "INFO")
+        
+        # Compare versions (simple string comparison works for semver)
+        if latest_version > current:
+            log(f"New version available: {latest_version}", "UPDATE")
+            return latest_version
+        else:
+            log("You have the latest version", "SUCCESS")
+            return None
+            
+    except urllib.error.URLError as e:
+        log(f"Update check failed: {e}", "WARN")
+        return None
+    except Exception as e:
+        log(f"Update check error: {e}", "ERROR")
+        return None
+
+def download_file(url, destination, progress_callback=None):
+    """
+    Download file with progress tracking
+    Returns True if successful
+    """
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        req = urllib.request.Request(
+            url,
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            chunk_size = 8192
+            
+            with open(destination, 'wb') as out_file:
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    out_file.write(chunk)
+                    downloaded += len(chunk)
+                    
+                    if progress_callback and total_size:
+                        progress = (downloaded / total_size) * 100
+                        progress_callback(progress)
+        
+        return True
+        
+    except Exception as e:
+        log(f"Download failed: {e}", "ERROR")
+        return False
+
+def perform_update(latest_version):
+    """
+    Download and install update
+    Shows progress dialog and launches updater
+    """
+    root = get_root()
+    
+    # Create progress dialog
+    update_win = tk.Toplevel(root)
+    update_win.title("Updating Marg ERP Auto Printer")
+    update_win.geometry("400x200")
+    update_win.configure(bg=THEME["bg"])
+    update_win.resizable(False, False)
+    update_win.grab_set()
+    
+    # Center window
+    update_win.update_idletasks()
+    x = (update_win.winfo_screenwidth() // 2) - (400 // 2)
+    y = (update_win.winfo_screenheight() // 2) - (200 // 2)
+    update_win.geometry(f'400x200+{x}+{y}')
+    
+    # Header
+    tk.Label(
+        update_win,
+        text="⬆ Updating Application",
+        font=("Segoe UI", 14, "bold"),
+        fg=THEME["text"],
+        bg=THEME["bg"]
+    ).pack(pady=(20, 10))
+    
+    tk.Label(
+        update_win,
+        text=f"Downloading version {latest_version}...",
+        font=FONT_LABEL,
+        fg=THEME["text_dim"],
+        bg=THEME["bg"]
+    ).pack()
+    
+    # Progress bar
+    progress_frame = tk.Frame(update_win, bg=THEME["bg"])
+    progress_frame.pack(fill='x', padx=40, pady=20)
+    
+    progress_bar = tk.Frame(
+        progress_frame,
+        bg=THEME["border"],
+        height=6,
+        width=300
+    )
+    progress_bar.pack()
+    progress_bar.pack_propagate(False)
+    
+    progress_fill = tk.Frame(
+        progress_bar,
+        bg=THEME["accent"],
+        height=6,
+        width=0
+    )
+    progress_fill.place(x=0, y=0)
+    
+    progress_label = tk.Label(
+        update_win,
+        text="0%",
+        font=FONT_LABEL_SM,
+        fg=THEME["text_dim"],
+        bg=THEME["bg"]
+    )
+    progress_label.pack()
+    
+    def update_progress(percent):
+        progress_fill.config(width=int(300 * percent / 100))
+        progress_label.config(text=f"{percent:.1f}%")
+        update_win.update()
+    
+    # Download update in background
+    def download_update():
+        try:
+            # Download new version
+            temp_exe = os.path.join(tempfile.gettempdir(), "MargAutoPrinter_new.exe")
+            
+            success = download_file(EXE_URL, temp_exe, update_progress)
+            
+            if success:
+                update_win.after(0, lambda: finish_update(temp_exe, update_win))
+            else:
+                update_win.after(0, lambda: show_update_error(update_win))
+                
+        except Exception as e:
+            log(f"Update download error: {e}", "ERROR")
+            update_win.after(0, lambda: show_update_error(update_win))
+    
+    def finish_update(temp_exe, win):
+        win.destroy()
+        
+        # Save current version to file
+        with open(VERSION_FILE, 'w') as f:
+            f.write(latest_version)
+        
+        # Launch updater if available, otherwise do direct update
+        if os.path.exists(UPDATER_PATH):
+            log("Launching updater...", "UPDATE")
+            subprocess.Popen([UPDATER_PATH, temp_exe])
+        else:
+            # Direct update (simpler but may have file locks)
+            try:
+                current_exe = sys.executable if IS_FROZEN else __file__
+                shutil.copy2(temp_exe, current_exe)
+                log("Update completed, restarting...", "SUCCESS")
+                os.startfile(current_exe)
+            except Exception as e:
+                log(f"Direct update failed: {e}", "ERROR")
+                messagebox.showerror(
+                    "Update Failed",
+                    f"Could not update automatically.\nPlease download manually from:\n{EXE_URL}"
+                )
+        
+        # Exit current instance
+        stop_event.set()
+        root.quit()
+    
+    def show_update_error(win):
+        win.destroy()
+        messagebox.showerror(
+            "Update Failed",
+            "Failed to download update.\nPlease check your internet connection and try again."
+        )
+    
+    # Start download thread
+    threading.Thread(target=download_update, daemon=True).start()
+    
+    # Wait for dialog to close
+    update_win.wait_window()
 
 # ==============================
 # DEFAULT CONFIG
@@ -126,6 +377,8 @@ DEFAULT_CONFIG = {
     "file_prefix":    "Marg_erp",
     "check_interval": 3,
     "silent_mode":    True,
+    "auto_update":    True,
+    "update_channel": "stable",
 }
 
 # ==============================
@@ -179,7 +432,7 @@ def first_time_setup() -> dict:
 
     win = tk.Toplevel(root)
     win.title("Marg ERP Auto Printer — Setup")
-    win.geometry("520x570")
+    win.geometry("520x650")
     win.resizable(False, False)
     win.configure(bg=THEME["bg"])
     win.grab_set()
@@ -192,7 +445,7 @@ def first_time_setup() -> dict:
     hdr = tk.Frame(win, bg=THEME["bg"], pady=18); hdr.pack(fill="x")
     tk.Label(hdr, text="🖨  Marg ERP Auto Printer",
              font=("Segoe UI", 16, "bold"), fg=THEME["text"], bg=THEME["bg"]).pack()
-    tk.Label(hdr, text="Initial Configuration",
+    tk.Label(hdr, text=f"Version {APP_VERSION} — Initial Configuration",
              font=FONT_LABEL_SM, fg=THEME["text_dim"], bg=THEME["bg"]).pack()
     tk.Frame(win, bg=THEME["border"], height=1).pack(fill="x", padx=30)
 
@@ -250,6 +503,15 @@ def first_time_setup() -> dict:
                    bg=THEME["bg"], selectcolor=THEME["surface2"],
                    relief="flat", bd=0, activebackground=THEME["bg"]).pack(side="right", padx=4)
 
+    # Auto update
+    update_var = tk.BooleanVar(value=True)
+    uf = tk.Frame(form, bg=THEME["bg"]); uf.pack(fill="x", pady=(10,0))
+    tk.Label(uf, text="⬆  Auto Update",
+             font=FONT_LABEL, fg=THEME["text"], bg=THEME["bg"]).pack(side="left")
+    tk.Checkbutton(uf, variable=update_var,
+                   bg=THEME["bg"], selectcolor=THEME["surface2"],
+                   relief="flat", bd=0, activebackground=THEME["bg"]).pack(side="right")
+
     tk.Frame(win, bg=THEME["border"], height=1).pack(fill="x", padx=30)
 
     def _save():
@@ -262,9 +524,15 @@ def first_time_setup() -> dict:
                 "file_prefix":    prefix_var.get(),
                 "check_interval": int(interval_var.get()),
                 "silent_mode":    silent_var.get(),
+                "auto_update":    update_var.get(),
             })
             with open(CONFIG_FILE, "w") as f:
                 json.dump(result, f, indent=4)
+            
+            # Save version
+            with open(VERSION_FILE, "w") as f:
+                f.write(APP_VERSION)
+            
             messagebox.showinfo("Saved", "✔  Configuration saved!", parent=win)
             win.destroy()
         except Exception as e:
@@ -276,7 +544,7 @@ def first_time_setup() -> dict:
               relief="flat", bd=0, cursor="hand2", padx=20, pady=10,
               activebackground=THEME["accent2"], activeforeground=THEME["text"]).pack()
 
-    tk.Label(win, text="Developed by Mehak Singh | TheMehakCodes",
+    tk.Label(win, text=f"Developed by Mehak Singh | TheMehakCodes | v{APP_VERSION}",
              font=FONT_CREDIT, fg=THEME["text_dim"], bg=THEME["bg"]).pack(pady=(0,10))
 
     win.wait_window()   # block until closed
@@ -303,6 +571,7 @@ WATCH_FOLDER     = CONFIG.get("watch_folder",   DEFAULT_CONFIG["watch_folder"])
 FILE_PREFIX      = CONFIG.get("file_prefix",    DEFAULT_CONFIG["file_prefix"])
 CHECK_INTERVAL   = CONFIG.get("check_interval", DEFAULT_CONFIG["check_interval"])
 USE_SILENT_MODE  = CONFIG.get("silent_mode",    DEFAULT_CONFIG["silent_mode"])
+AUTO_UPDATE      = CONFIG.get("auto_update",    DEFAULT_CONFIG["auto_update"])
 
 # ==============================
 # PRINT FUNCTIONS
@@ -346,22 +615,6 @@ def print_pdf_silent(fp: str):
     except Exception as e:
         log(f"Silent print error: {e}", "ERROR")
         print_pdf_legacy(fp)
-        
-    try:
-        if not os.path.exists(SUMATRA_PATH):
-            log("SumatraPDF not found — legacy fallback", "WARN")
-            print_pdf_legacy(fp); return
-        subprocess.Popen(
-            [SUMATRA_PATH, "-print-to", SELECTED_PRINTER,
-             "-silent", "-exit-on-print", fp],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        time.sleep(3)
-        if os.path.exists(fp): os.remove(fp)
-    except Exception as e:
-        log(f"Silent print error: {e}", "ERROR")
-        print_pdf_legacy(fp)
 
 def print_pdf(fp: str):
     name = os.path.basename(fp)
@@ -376,13 +629,17 @@ def print_pdf(fp: str):
 def get_marg_files():
     if not os.path.exists(WATCH_FOLDER):
         log(f"Watch folder missing: {WATCH_FOLDER}", "ERROR"); return []
-    files = [
-        os.path.join(WATCH_FOLDER, f)
-        for f in os.listdir(WATCH_FOLDER)
-        if f.startswith(FILE_PREFIX) and f.lower().endswith(".pdf")
-    ]
-    files.sort(key=os.path.getctime)
-    return files
+    try:
+        files = [
+            os.path.join(WATCH_FOLDER, f)
+            for f in os.listdir(WATCH_FOLDER)
+            if f.startswith(FILE_PREFIX) and f.lower().endswith(".pdf")
+        ]
+        files.sort(key=os.path.getctime)
+        return files
+    except Exception as e:
+        log(f"Error scanning folder: {e}", "ERROR")
+        return []
 
 stop_event = threading.Event()
 
@@ -391,12 +648,18 @@ def watcher_loop():
     log(f"Printer : {SELECTED_PRINTER}", "INFO")
     log(f"Folder  : {WATCH_FOLDER}",     "INFO")
     log(f"Prefix  : {FILE_PREFIX}",      "INFO")
+    log(f"Version : {APP_VERSION}",      "INFO")
+    
     while not stop_event.is_set():
-        for fp in get_marg_files():
-            if stop_event.is_set(): break
-            time.sleep(2)
-            print_pdf(fp)
-        stop_event.wait(CHECK_INTERVAL)
+        try:
+            for fp in get_marg_files():
+                if stop_event.is_set(): break
+                time.sleep(2)
+                print_pdf(fp)
+            stop_event.wait(CHECK_INTERVAL)
+        except Exception as e:
+            log(f"Watcher error: {e}", "ERROR")
+            stop_event.wait(CHECK_INTERVAL)
 
 # ==============================
 # LOG WINDOW
@@ -429,7 +692,7 @@ def open_log_window():
     # header
     tk.Frame(win, bg=THEME["accent2"], height=5).pack(fill="x")
     hdr = tk.Frame(win, bg=THEME["surface"], pady=8); hdr.pack(fill="x")
-    tk.Label(hdr, text="🖨  Marg ERP Auto Printer  —  Live Logs",
+    tk.Label(hdr, text=f"🖨  {APP_NAME}  —  Live Logs (v{APP_VERSION})",
              font=("Segoe UI", 11, "bold"), fg=THEME["text"],
              bg=THEME["surface"]).pack(side="left", padx=16)
     tk.Label(hdr, text="● RUNNING", font=("Segoe UI", 9, "bold"),
@@ -441,7 +704,8 @@ def open_log_window():
              text=(f"  Printer: {SELECTED_PRINTER}   │   Folder: {WATCH_FOLDER}"
                    f"   │   Prefix: {FILE_PREFIX}   │   "
                    f"Interval: {CHECK_INTERVAL}s   │   "
-                   f"Silent: {'ON' if USE_SILENT_MODE else 'OFF'}"),
+                   f"Silent: {'ON' if USE_SILENT_MODE else 'OFF'}   │   "
+                   f"Auto-Update: {'ON' if AUTO_UPDATE else 'OFF'}"),
              font=("Consolas", 8), fg=THEME["text_dim"],
              bg=THEME["surface2"], anchor="w").pack(fill="x", padx=12)
 
@@ -483,10 +747,25 @@ def open_log_window():
         win.clipboard_clear(); win.clipboard_append(txt.get("1.0","end"))
         messagebox.showinfo("Copied", "Log copied to clipboard.", parent=win)
 
+    def _check_update():
+        threading.Thread(target=_check_update_thread, daemon=True).start()
+
+    def _check_update_thread():
+        latest = check_for_updates()
+        if latest and latest > APP_VERSION:
+            win.after(0, lambda: perform_update(latest))
+        else:
+            win.after(0, lambda: messagebox.showinfo(
+                "No Updates",
+                f"You're running the latest version ({APP_VERSION}).",
+                parent=win
+            ))
+
     tk.Button(bb, text="🗑  Clear",  command=_clear,    **bkw).pack(side="left",  padx=(12,4))
     tk.Button(bb, text="📋  Copy",   command=_copy,     **bkw).pack(side="left",  padx=4)
+    tk.Button(bb, text="⬆  Check Update", command=_check_update, **bkw).pack(side="left", padx=4)
     tk.Button(bb, text="✖  Close",  command=_on_close, **bkw).pack(side="right", padx=12)
-    tk.Label(bb, text="Developed by Mehak Singh | TheMehakCodes",
+    tk.Label(bb, text=f"Developed by Mehak Singh | TheMehakCodes | v{APP_VERSION}",
              font=FONT_CREDIT, fg=THEME["text_dim"], bg=THEME["surface"]).pack(side="right", padx=16)
 
     # poll queue for new entries
@@ -509,7 +788,7 @@ def open_config_window():
     root = get_root()
     win  = tk.Toplevel(root)
     win.title("Edit Configuration")
-    win.geometry("520x560")
+    win.geometry("520x600")
     win.configure(bg=THEME["bg"])
     if os.path.exists(ICON_PATH):
         try: win.iconbitmap(ICON_PATH)
@@ -562,6 +841,14 @@ def open_config_window():
                    selectcolor=THEME["surface2"], relief="flat", bd=0,
                    activebackground=THEME["bg"]).pack(side="right")
 
+    update_var = tk.BooleanVar(value=AUTO_UPDATE)
+    uf = tk.Frame(form, bg=THEME["bg"]); uf.pack(fill="x", pady=(10,0))
+    tk.Label(uf, text="⬆  Auto Update", font=FONT_LABEL,
+             fg=THEME["text"], bg=THEME["bg"]).pack(side="left")
+    tk.Checkbutton(uf, variable=update_var, bg=THEME["bg"],
+                   selectcolor=THEME["surface2"], relief="flat", bd=0,
+                   activebackground=THEME["bg"]).pack(side="right")
+
     def _save():
         try:
             cfg = {
@@ -570,6 +857,7 @@ def open_config_window():
                 "file_prefix":    prefix_var.get(),
                 "check_interval": int(interval_var.get()),
                 "silent_mode":    silent_var.get(),
+                "auto_update":    update_var.get(),
             }
             with open(CONFIG_FILE, "w") as f:
                 json.dump(cfg, f, indent=4)
@@ -589,7 +877,7 @@ def open_config_window():
               padx=18, pady=8,
               activebackground=THEME["accent2"],
               activeforeground=THEME["text"]).pack()
-    tk.Label(win, text="Developed by Mehak Singh | TheMehakCodes",
+    tk.Label(win, text=f"Developed by Mehak Singh | TheMehakCodes | v{APP_VERSION}",
              font=FONT_CREDIT, fg=THEME["text_dim"], bg=THEME["bg"]).pack(pady=(0,10))
 
 # ==============================
@@ -609,14 +897,23 @@ def _make_tray_image() -> Image.Image:
     draw.text((20, 18), "M", fill="white")
     return img
 
-# Tray callbacks must be plain functions (pystray calls them from its thread).
-# We schedule Tk work onto the main thread via root.after().
-
 def _tray_show_logs(icon, item):
     get_root().after(0, open_log_window)
 
 def _tray_edit_config(icon, item):
     get_root().after(0, open_config_window)
+
+def _tray_check_update(icon, item):
+    def check():
+        latest = check_for_updates()
+        if latest and latest > APP_VERSION:
+            get_root().after(0, lambda: perform_update(latest))
+        else:
+            get_root().after(0, lambda: messagebox.showinfo(
+                "No Updates",
+                f"You're running the latest version ({APP_VERSION})."
+            ))
+    threading.Thread(target=check, daemon=True).start()
 
 def _tray_exit(icon, item):
     log("Shutting down…", "WARN")
@@ -627,7 +924,7 @@ def _tray_exit(icon, item):
 def build_tray() -> pystray.Icon:
     menu = pystray.Menu(
         pystray.MenuItem(
-            "🖨  Marg ERP Auto Printer",
+            f"🖨  {APP_NAME} v{APP_VERSION}",
             None,
             enabled=False,
         ),
@@ -635,11 +932,15 @@ def build_tray() -> pystray.Icon:
         pystray.MenuItem(
             "📋  Show Logs",
             _tray_show_logs,
-            default=True,       # ← double-click opens logs
+            default=True,
         ),
         pystray.MenuItem(
             "⚙️   Edit Config",
             _tray_edit_config,
+        ),
+        pystray.MenuItem(
+            "⬆   Check for Updates",
+            _tray_check_update,
         ),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(
@@ -650,7 +951,7 @@ def build_tray() -> pystray.Icon:
     return pystray.Icon(
         name  = "MargERPAutoPrinter",
         icon  = _make_tray_image(),
-        title = "Marg ERP Auto Printer",
+        title = f"{APP_NAME} v{APP_VERSION}",
         menu  = menu,
     )
 
@@ -659,16 +960,35 @@ def build_tray() -> pystray.Icon:
 # ==============================
 
 def main():
-    # 1 — start file watcher (daemon thread)
+    # Check for updates on startup
+    if AUTO_UPDATE and IS_FROZEN:
+        threading.Thread(target=lambda: check_for_updates_and_update(), daemon=True).start()
+    
+    # Start file watcher
     threading.Thread(target=watcher_loop, daemon=True, name="Watcher").start()
 
-    # 2 — start tray icon (daemon thread — pystray has its own loop)
+    # Start tray icon
     tray = build_tray()
     threading.Thread(target=tray.run, daemon=True, name="Tray").start()
 
-    # 3 — Tk event loop on main thread (required by Windows)
-    #     This keeps the process alive and handles all GUI callbacks.
+    # Tk event loop
     get_root().mainloop()
+
+def check_for_updates_and_update():
+    """Background update check"""
+    latest = check_for_updates()
+    if latest and latest > APP_VERSION:
+        # Ask user if they want to update
+        def ask_user():
+            result = messagebox.askyesno(
+                "Update Available",
+                f"A new version ({latest}) is available.\n\nCurrent version: {APP_VERSION}\n\nWould you like to update now?",
+                icon='question'
+            )
+            if result:
+                perform_update(latest)
+        
+        get_root().after(0, ask_user)
 
 if __name__ == "__main__":
     main()

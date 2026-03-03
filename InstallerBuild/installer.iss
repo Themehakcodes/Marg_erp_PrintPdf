@@ -47,6 +47,8 @@ Name: "startupicon";  Description: "Launch automatically at &Windows startup";  
 
 [Files]
 Source: "marg_auto_printer.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "updater.exe";            DestDir: "{app}"; Flags: ignoreversion   ; <-- ADD THIS LINE
+Source: "version.txt";            DestDir: "{app}"; Flags: ignoreversion   ; <-- ADD THIS LINE
 Source: "SumatraPDF.exe";        DestDir: "{app}"; Flags: ignoreversion
 Source: "logo.ico";              DestDir: "{app}"; Flags: ignoreversion
 
