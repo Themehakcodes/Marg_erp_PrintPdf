@@ -45,7 +45,7 @@ from PIL import Image, ImageDraw
 # VERSION
 # ==============================
 
-APP_VERSION        = "1.0.0"
+APP_VERSION        = "1.0.2"
 UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Themehakcodes/Marg_erp_PrintPdf/main/version.json"
 
 # ==============================
@@ -192,20 +192,35 @@ def _do_update_check(silent: bool = True, parent_win=None):
     silent=True  → only log, no popups unless update found
     silent=False → show result in a popup (manual check from tray/log window)
     parent_win   → Tk window to use as messagebox parent (optional)
+
+    UPDATE FLOW (fully silent, no UAC / no installer):
+      1. Download new .exe to update_new.exe beside current exe
+      2. Validate size + optional SHA-256
+      3. Write a tiny _marg_updater.bat that:
+           - waits for THIS process to exit
+           - moves update_new.exe over the current exe
+           - restarts the new exe
+           - deletes itself
+      4. Launch the bat detached (hidden), then do a clean sys.exit()
+         so the bat's "wait for process" loop actually fires.
     """
     try:
-        import requests
+        import urllib.request
         import hashlib
 
         log("Checking for updates…", "UPDATE")
 
-        resp = requests.get(UPDATE_VERSION_URL, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+        # ── Fetch version manifest ────────────────────────────────────
+        req  = urllib.request.Request(
+            UPDATE_VERSION_URL,
+            headers={"User-Agent": "MargERPAutoPrinter-Updater"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
 
         remote_ver = data.get("version", "0.0.0")
         exe_url    = data.get("exe_url",  "")
-        remote_sha = data.get("sha256",   "")   # optional
+        remote_sha = data.get("sha256",   "").lower()
 
         if _parse_version(remote_ver) <= _parse_version(APP_VERSION):
             log(f"Already up to date  (v{APP_VERSION})", "SUCCESS")
@@ -222,21 +237,27 @@ def _do_update_check(silent: bool = True, parent_win=None):
         log(f"Update available!  v{APP_VERSION}  →  v{remote_ver}", "UPDATE")
         log("Downloading new version silently…", "UPDATE")
 
-        # ── Download ──────────────────────────────────────────────────
+        # ── Resolve paths ─────────────────────────────────────────────
         current_exe = sys.executable if getattr(sys, "frozen", False) \
                       else os.path.abspath(__file__)
         app_dir     = os.path.dirname(current_exe)
+        exe_name    = os.path.basename(current_exe)
         update_path = os.path.join(app_dir, "update_new.exe")
 
-        dl     = requests.get(exe_url, timeout=180, stream=True)
-        dl.raise_for_status()
+        # ── Download ──────────────────────────────────────────────────
+        dl_req = urllib.request.Request(
+            exe_url,
+            headers={"User-Agent": "MargERPAutoPrinter-Updater"}
+        )
         hasher = hashlib.sha256()
-
-        with open(update_path, "wb") as f:
-            for chunk in dl.iter_content(chunk_size=65536):
-                if chunk:
-                    f.write(chunk)
-                    hasher.update(chunk)
+        with urllib.request.urlopen(dl_req, timeout=180) as dl_resp, \
+             open(update_path, "wb") as out_f:
+            while True:
+                chunk = dl_resp.read(65536)
+                if not chunk:
+                    break
+                out_f.write(chunk)
+                hasher.update(chunk)
 
         # ── Size guard ────────────────────────────────────────────────
         if os.path.getsize(update_path) < 100_000:
@@ -247,8 +268,8 @@ def _do_update_check(silent: bool = True, parent_win=None):
 
         # ── Optional SHA-256 validation ───────────────────────────────
         if remote_sha:
-            actual_sha = hasher.hexdigest()
-            if actual_sha.lower() != remote_sha.lower():
+            actual_sha = hasher.hexdigest().lower()
+            if actual_sha != remote_sha:
                 log(f"Checksum mismatch — aborting. Got: {actual_sha}", "ERROR")
                 try: os.remove(update_path)
                 except Exception: pass
@@ -257,37 +278,51 @@ def _do_update_check(silent: bool = True, parent_win=None):
 
         log(f"Download complete. Installing v{remote_ver}…", "UPDATE")
 
-        # ── Write updater batch file ───────────────────────────────────
+        # ── Write updater batch ───────────────────────────────────────
+        # Uses the PID of THIS process so the bat waits only until we
+        # actually exit (no fixed ping delay that might be too short).
         bat_path = os.path.join(app_dir, "_marg_updater.bat")
-        exe_name = os.path.basename(current_exe)
+        pid      = os.getpid()
         bat_contents = (
             "@echo off\n"
-            "ping 127.0.0.1 -n 3 >nul\n"
-            f'taskkill /F /IM "{exe_name}" >nul 2>&1\n'
-            "ping 127.0.0.1 -n 2 >nul\n"
-            f'move /Y "{update_path}" "{current_exe}"\n'
+            "setlocal\n"
+            # Wait until our PID disappears (poll every 500 ms, max ~30 s)
+            f":wait\n"
+            f'tasklist /FI "PID eq {pid}" 2>nul | find /I "{pid}" >nul\n'
+            "if not errorlevel 1 (\n"
+            "    ping 127.0.0.1 -n 1 -w 500 >nul\n"
+            "    goto wait\n"
+            ")\n"
+            # Replace exe
+            f'move /Y "{update_path}" "{current_exe}" >nul 2>&1\n'
+            # Restart silently
             f'start "" "{current_exe}"\n'
-            "del \"%~f0\"\n"
+            # Self-delete
+            "(goto) 2>nul & del \"%~f0\"\n"
         )
         with open(bat_path, "w") as f:
             f.write(bat_contents)
 
-        # ── Launch updater detached, then force-exit ──────────────────
+        # ── Launch bat fully detached & hidden ────────────────────────
+        # DETACHED_PROCESS + CREATE_NO_WINDOW → no console, no flash.
+        # Do NOT pass close_fds on Windows — it is unsupported and raises.
         subprocess.Popen(
             ["cmd.exe", "/C", bat_path],
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-            close_fds=True,
+            creationflags=(subprocess.DETACHED_PROCESS |
+                           subprocess.CREATE_NO_WINDOW),
         )
 
+        log("Updater launched — restarting now…", "UPDATE")
+
+        # ── Clean shutdown so the bat's PID-wait loop actually fires ──
         stop_event.set()
-        time.sleep(1)
-        os.kill(os.getpid(), 9)
+        get_root().after(0, get_root().destroy)   # ends Tk mainloop cleanly
 
     except Exception as e:
         err_type = type(e).__name__
-        if "ConnectionError" in err_type or "ConnectTimeout" in err_type:
+        if "URLError" in err_type or "ConnectionRefused" in err_type:
             log("Update check skipped — no internet connection.", "INFO")
-        elif "Timeout" in err_type:
+        elif "timeout" in str(e).lower() or "Timeout" in err_type:
             log("Update check timed out.", "WARN")
         else:
             log(f"Update check failed: {e}", "WARN")
