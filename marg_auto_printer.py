@@ -9,6 +9,10 @@
 #  2. As a safety net, the very first thing we do (before ANY import
 #     that might flash a window) is call the Win32 API to hide the
 #     console window if one somehow exists.
+#
+#  UPDATE TYPES (controlled by version.json → "release_type"):
+#  • "direct"    → new .exe replaces current .exe silently, auto-restarts
+#  • "installer" → downloaded Setup.exe is launched for the user to run
 # ============================================================
 
 import ctypes, sys
@@ -44,8 +48,6 @@ from PIL import Image, ImageDraw
 # ==============================
 # VERSION
 # ==============================
-
-#test 
 
 APP_VERSION        = "1.0.3"
 UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Themehakcodes/Marg_erp_PrintPdf/main/version.json"
@@ -188,42 +190,229 @@ def _parse_version(v: str):
         return (0, 0, 0)
 
 
+def _apply_direct_update(exe_url: str, remote_ver: str,
+                          remote_sha: str, silent: bool, parent_win):
+    """
+    DIRECT EXE update flow  (release_type == "direct")
+    ─────────────────────────────────────────────────
+    1. Download new .exe → update_new.exe (same folder)
+    2. Validate size + optional SHA-256
+    3. Write _marg_updater.bat that:
+         • waits for THIS process to exit (PID-poll, no fixed delay)
+         • moves update_new.exe over current exe
+         • restarts the new exe silently
+         • self-deletes
+    4. Launch bat detached → clean sys.exit() so bat's wait fires
+    """
+    import urllib.request, hashlib
+
+    current_exe = sys.executable if getattr(sys, "frozen", False) \
+                  else os.path.abspath(__file__)
+    app_dir     = os.path.dirname(current_exe)
+    update_path = os.path.join(app_dir, "update_new.exe")
+
+    log("Downloading direct EXE update silently…", "UPDATE")
+
+    # ── Download ──────────────────────────────────────────────────
+    dl_req = urllib.request.Request(
+        exe_url,
+        headers={"User-Agent": "MargERPAutoPrinter-Updater"}
+    )
+    hasher = hashlib.sha256()
+    with urllib.request.urlopen(dl_req, timeout=180) as dl_resp, \
+         open(update_path, "wb") as out_f:
+        while True:
+            chunk = dl_resp.read(65536)
+            if not chunk:
+                break
+            out_f.write(chunk)
+            hasher.update(chunk)
+
+    # ── Size guard ────────────────────────────────────────────────
+    if os.path.getsize(update_path) < 100_000:
+        log("Downloaded file too small — aborting update.", "ERROR")
+        try: os.remove(update_path)
+        except Exception: pass
+        return
+
+    # ── Optional SHA-256 validation ───────────────────────────────
+    if remote_sha:
+        actual_sha = hasher.hexdigest().lower()
+        if actual_sha != remote_sha.lower():
+            log(f"Checksum mismatch — aborting. Got: {actual_sha}", "ERROR")
+            try: os.remove(update_path)
+            except Exception: pass
+            return
+        log("SHA-256 checksum verified ✔", "SUCCESS")
+
+    log(f"Download complete. Installing v{remote_ver} silently…", "UPDATE")
+
+    # ── Write updater batch ───────────────────────────────────────
+    bat_path = os.path.join(app_dir, "_marg_updater.bat")
+    pid      = os.getpid()
+    bat_contents = (
+        "@echo off\n"
+        "setlocal\n"
+        # Wait until our PID disappears (poll every 500 ms, max ~30 s)
+        f":wait\n"
+        f'tasklist /FI "PID eq {pid}" 2>nul | find /I "{pid}" >nul\n'
+        "if not errorlevel 1 (\n"
+        "    ping 127.0.0.1 -n 1 -w 500 >nul\n"
+        "    goto wait\n"
+        ")\n"
+        # Replace exe
+        f'move /Y "{update_path}" "{current_exe}" >nul 2>&1\n'
+        # Restart silently
+        f'start "" "{current_exe}"\n'
+        # Self-delete
+        "(goto) 2>nul & del \"%~f0\"\n"
+    )
+    with open(bat_path, "w") as f:
+        f.write(bat_contents)
+
+    # ── Launch bat fully detached & hidden ────────────────────────
+    subprocess.Popen(
+        ["cmd.exe", "/C", bat_path],
+        creationflags=(subprocess.DETACHED_PROCESS |
+                       subprocess.CREATE_NO_WINDOW),
+    )
+
+    log("Updater launched — restarting now…", "UPDATE")
+
+    # ── Clean shutdown so the bat's PID-wait loop actually fires ──
+    stop_event.set()
+    get_root().after(0, get_root().destroy)
+
+
+def _apply_installer_update(exe_url: str, remote_ver: str,
+                             remote_sha: str, silent: bool, parent_win):
+    """
+    INSTALLER EXE update flow  (release_type == "installer")
+    ─────────────────────────────────────────────────────────
+    1. Download Setup exe → update_setup.exe (same folder)
+    2. Validate size + optional SHA-256
+    3. Prompt the user with a messagebox (even in silent startup mode,
+       because an installer always needs the user to run it)
+    4. If user confirms → launch the installer normally (visible UAC prompt)
+       Current app keeps running until user closes it / installer replaces it.
+    """
+    import urllib.request, hashlib
+
+    current_exe = sys.executable if getattr(sys, "frozen", False) \
+                  else os.path.abspath(__file__)
+    app_dir      = os.path.dirname(current_exe)
+    setup_path   = os.path.join(app_dir, "update_setup.exe")
+
+    log("Downloading installer update…", "UPDATE")
+
+    # ── Download ──────────────────────────────────────────────────
+    dl_req = urllib.request.Request(
+        exe_url,
+        headers={"User-Agent": "MargERPAutoPrinter-Updater"}
+    )
+    hasher = hashlib.sha256()
+    with urllib.request.urlopen(dl_req, timeout=180) as dl_resp, \
+         open(setup_path, "wb") as out_f:
+        while True:
+            chunk = dl_resp.read(65536)
+            if not chunk:
+                break
+            out_f.write(chunk)
+            hasher.update(chunk)
+
+    # ── Size guard ────────────────────────────────────────────────
+    if os.path.getsize(setup_path) < 100_000:
+        log("Downloaded installer too small — aborting.", "ERROR")
+        try: os.remove(setup_path)
+        except Exception: pass
+        return
+
+    # ── Optional SHA-256 validation ───────────────────────────────
+    if remote_sha:
+        actual_sha = hasher.hexdigest().lower()
+        if actual_sha != remote_sha.lower():
+            log(f"Checksum mismatch — aborting. Got: {actual_sha}", "ERROR")
+            try: os.remove(setup_path)
+            except Exception: pass
+            return
+        log("SHA-256 checksum verified ✔", "SUCCESS")
+
+    log(f"Installer downloaded for v{remote_ver}. Prompting user…", "UPDATE")
+
+    # ── Prompt user (always shown — installer needs human interaction) ─
+    def _prompt():
+        answer = messagebox.askyesno(
+            "Update Available — Installer Ready",
+            f"✔  A new version is ready to install.\n\n"
+            f"Current version : v{APP_VERSION}\n"
+            f"New version     : v{remote_ver}\n\n"
+            f"The installer has been downloaded to:\n{setup_path}\n\n"
+            f"Click YES to launch the installer now.\n"
+            f"(You can also run it manually from the above path later.)",
+            parent=parent_win or get_root()
+        )
+        if answer:
+            log("User confirmed — launching installer…", "UPDATE")
+            try:
+                # ShellExecute with "runas" triggers proper UAC elevation
+                ctypes.windll.shell32.ShellExecuteW(
+                    None, "runas", setup_path, None, None, 1
+                )
+                log("Installer launched. Close this app if prompted.", "INFO")
+            except Exception as e:
+                log(f"Failed to launch installer: {e}", "ERROR")
+                messagebox.showerror(
+                    "Launch Failed",
+                    f"Could not launch the installer automatically.\n\n"
+                    f"Please run it manually:\n{setup_path}",
+                    parent=parent_win or get_root()
+                )
+        else:
+            log(f"User postponed installer update. File kept at: {setup_path}", "WARN")
+
+    get_root().after(0, _prompt)
+
+
 def _do_update_check(silent: bool = True, parent_win=None):
     """
     Core update logic — runs in a background thread.
-    silent=True  → only log, no popups unless update found
-    silent=False → show result in a popup (manual check from tray/log window)
-    parent_win   → Tk window to use as messagebox parent (optional)
 
-    UPDATE FLOW (fully silent, no UAC / no installer):
-      1. Download new .exe to update_new.exe beside current exe
-      2. Validate size + optional SHA-256
-      3. Write a tiny _marg_updater.bat that:
-           - waits for THIS process to exit
-           - moves update_new.exe over the current exe
-           - restarts the new exe
-           - deletes itself
-      4. Launch the bat detached (hidden), then do a clean sys.exit()
-         so the bat's "wait for process" loop actually fires.
+    version.json schema expected:
+    {
+        "version":      "1.2.0",
+        "release_type": "direct",       ← "direct" | "installer"
+        "exe_url":      "https://...",
+        "sha256":       "abc123..."     ← optional
+    }
+
+    release_type == "direct"
+        → silent download + bat-swap + auto-restart (no user prompt needed)
+
+    release_type == "installer"
+        → download Setup.exe → always prompt user → user runs installer
     """
     try:
         import urllib.request
-        import hashlib
 
         log("Checking for updates…", "UPDATE")
 
         # ── Fetch version manifest ────────────────────────────────────
-        req  = urllib.request.Request(
+        req = urllib.request.Request(
             UPDATE_VERSION_URL,
             headers={"User-Agent": "MargERPAutoPrinter-Updater"}
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
 
-        remote_ver = data.get("version", "0.0.0")
-        exe_url    = data.get("exe_url",  "")
-        remote_sha = data.get("sha256",   "").lower()
+        remote_ver    = data.get("version",      "0.0.0")
+        exe_url       = data.get("exe_url",       "")
+        remote_sha    = data.get("sha256",        "").lower()
+        release_type  = data.get("release_type", "direct").lower()
+        # Normalise: any value other than "installer" is treated as "direct"
+        if release_type not in ("direct", "installer"):
+            release_type = "direct"
 
+        # ── Already up to date? ───────────────────────────────────────
         if _parse_version(remote_ver) <= _parse_version(APP_VERSION):
             log(f"Already up to date  (v{APP_VERSION})", "SUCCESS")
             if not silent:
@@ -236,89 +425,16 @@ def _do_update_check(silent: bool = True, parent_win=None):
                 get_root().after(0, _show)
             return
 
-        log(f"Update available!  v{APP_VERSION}  →  v{remote_ver}", "UPDATE")
-        log("Downloading new version silently…", "UPDATE")
+        log(f"Update available!  v{APP_VERSION}  →  v{remote_ver}  "
+            f"[type: {release_type}]", "UPDATE")
 
-        # ── Resolve paths ─────────────────────────────────────────────
-        current_exe = sys.executable if getattr(sys, "frozen", False) \
-                      else os.path.abspath(__file__)
-        app_dir     = os.path.dirname(current_exe)
-        exe_name    = os.path.basename(current_exe)
-        update_path = os.path.join(app_dir, "update_new.exe")
-
-        # ── Download ──────────────────────────────────────────────────
-        dl_req = urllib.request.Request(
-            exe_url,
-            headers={"User-Agent": "MargERPAutoPrinter-Updater"}
-        )
-        hasher = hashlib.sha256()
-        with urllib.request.urlopen(dl_req, timeout=180) as dl_resp, \
-             open(update_path, "wb") as out_f:
-            while True:
-                chunk = dl_resp.read(65536)
-                if not chunk:
-                    break
-                out_f.write(chunk)
-                hasher.update(chunk)
-
-        # ── Size guard ────────────────────────────────────────────────
-        if os.path.getsize(update_path) < 100_000:
-            log("Downloaded file too small — aborting update.", "ERROR")
-            try: os.remove(update_path)
-            except Exception: pass
-            return
-
-        # ── Optional SHA-256 validation ───────────────────────────────
-        if remote_sha:
-            actual_sha = hasher.hexdigest().lower()
-            if actual_sha != remote_sha:
-                log(f"Checksum mismatch — aborting. Got: {actual_sha}", "ERROR")
-                try: os.remove(update_path)
-                except Exception: pass
-                return
-            log("SHA-256 checksum verified ✔", "SUCCESS")
-
-        log(f"Download complete. Installing v{remote_ver}…", "UPDATE")
-
-        # ── Write updater batch ───────────────────────────────────────
-        # Uses the PID of THIS process so the bat waits only until we
-        # actually exit (no fixed ping delay that might be too short).
-        bat_path = os.path.join(app_dir, "_marg_updater.bat")
-        pid      = os.getpid()
-        bat_contents = (
-            "@echo off\n"
-            "setlocal\n"
-            # Wait until our PID disappears (poll every 500 ms, max ~30 s)
-            f":wait\n"
-            f'tasklist /FI "PID eq {pid}" 2>nul | find /I "{pid}" >nul\n'
-            "if not errorlevel 1 (\n"
-            "    ping 127.0.0.1 -n 1 -w 500 >nul\n"
-            "    goto wait\n"
-            ")\n"
-            # Replace exe
-            f'move /Y "{update_path}" "{current_exe}" >nul 2>&1\n'
-            # Restart silently
-            f'start "" "{current_exe}"\n'
-            # Self-delete
-            "(goto) 2>nul & del \"%~f0\"\n"
-        )
-        with open(bat_path, "w") as f:
-            f.write(bat_contents)
-
-        # ── Launch bat fully detached & hidden ────────────────────────
-        # DETACHED_PROCESS + CREATE_NO_WINDOW → no console, no flash.
-        # Do NOT pass close_fds on Windows — it is unsupported and raises.
-        subprocess.Popen(
-            ["cmd.exe", "/C", bat_path],
-            creationflags=(subprocess.DETACHED_PROCESS |
-                           subprocess.CREATE_NO_WINDOW),
-        )
-
-        log("Updater launched — restarting now…", "UPDATE")
-
-        # ── Clean shutdown so the bat's PID-wait loop actually fires ──
-        stop_event.set()
-        get_root().after(0, get_root().destroy)   # ends Tk mainloop cleanly
+        # ── Route to the correct update handler ───────────────────────
+        if release_type == "installer":
+            _apply_installer_update(exe_url, remote_ver, remote_sha,
+                                    silent, parent_win)
+        else:
+            _apply_direct_update(exe_url, remote_ver, remote_sha,
+                                 silent, parent_win)
 
     except Exception as e:
         err_type = type(e).__name__
@@ -527,21 +643,9 @@ def print_pdf(fp: str):
 # ==============================
 # PRINT QUEUE  (guaranteed ordered, no missed files)
 # ==============================
-#
-#  How it works:
-#  • A dedicated daemon thread (`print_worker`) blocks on `_print_queue`.
-#  • The watcher puts file-paths into `_print_queue` one by one.
-#  • `_queued_files` is a set that tracks what has already been enqueued
-#    so the watcher never adds the same file twice.
-#  • Files are sorted by creation-time before being enqueued, so even if
-#    multiple PDFs arrive in the same scan cycle they go in the right order.
-#  • The worker processes one file at a time — the next job only starts
-#    after the previous print_pdf() call has fully returned, guaranteeing
-#    nothing is skipped or overlapped.
-# ==============================
 
-_print_queue   = queue.Queue()   # holds absolute file paths
-_queued_files  = set()           # paths already enqueued (guard against duplicates)
+_print_queue   = queue.Queue()
+_queued_files  = set()
 _queued_lock   = threading.Lock()
 
 
@@ -556,19 +660,12 @@ def _enqueue_file(fp: str):
 
 
 def print_worker():
-    """
-    Dedicated worker thread.
-    Blocks waiting for jobs, prints them strictly one-at-a-time in FIFO order.
-    Removes the path from _queued_files after the file has been processed
-    so a re-appeared file (edge case) can be re-queued.
-    """
     log("Print worker started — ready for jobs.", "INFO")
     while not stop_event.is_set():
         try:
-            fp = _print_queue.get(timeout=1)   # 1 s timeout so we can check stop_event
+            fp = _print_queue.get(timeout=1)
         except queue.Empty:
             continue
-
         try:
             if os.path.exists(fp):
                 print_pdf(fp)
@@ -593,7 +690,7 @@ def get_marg_files():
         for f in os.listdir(WATCH_FOLDER)
         if f.startswith(FILE_PREFIX) and f.lower().endswith(".pdf")
     ]
-    files.sort(key=os.path.getctime)   # oldest first — preserves print order
+    files.sort(key=os.path.getctime)
     return files
 
 stop_event = threading.Event()
@@ -608,15 +705,15 @@ def watcher_loop():
         for fp in get_marg_files():
             if stop_event.is_set():
                 break
-            _enqueue_file(fp)          # hand off to the print queue worker
+            _enqueue_file(fp)
         stop_event.wait(CHECK_INTERVAL)
 
 # ==============================
-# LOG WINDOW  (with Check Update button)
+# LOG WINDOW
 # ==============================
 
 _log_win_open = False
-_log_win_ref  = None   # holds reference to the open log window
+_log_win_ref  = None
 
 
 def open_log_window():
@@ -648,7 +745,6 @@ def open_log_window():
         win.destroy()
     win.protocol("WM_DELETE_WINDOW", _on_close)
 
-    # ── Header ────────────────────────────────────────────────────────
     tk.Frame(win, bg=THEME["accent2"], height=5).pack(fill="x")
     hdr = tk.Frame(win, bg=THEME["surface"], pady=8); hdr.pack(fill="x")
     tk.Label(hdr, text="🖨  Marg ERP Auto Printer  —  Live Logs",
@@ -659,7 +755,6 @@ def open_log_window():
     tk.Label(hdr, text="● RUNNING", font=("Segoe UI", 9, "bold"),
              fg=THEME["success"], bg=THEME["surface"]).pack(side="right", padx=10)
 
-    # ── Info strip ────────────────────────────────────────────────────
     info = tk.Frame(win, bg=THEME["surface2"], pady=4); info.pack(fill="x")
     tk.Label(info,
              text=(f"  Printer: {SELECTED_PRINTER}   │   Folder: {WATCH_FOLDER}"
@@ -669,7 +764,6 @@ def open_log_window():
              font=("Consolas", 8), fg=THEME["text_dim"],
              bg=THEME["surface2"], anchor="w").pack(fill="x", padx=12)
 
-    # ── Text widget ───────────────────────────────────────────────────
     tf = tk.Frame(win, bg=THEME["bg"]); tf.pack(fill="both", expand=True, padx=8, pady=8)
     sb = tk.Scrollbar(tf, bg=THEME["surface2"], troughcolor=THEME["bg"],
                       activebackground=THEME["accent"])
@@ -692,7 +786,6 @@ def open_log_window():
     for lvl, entry in log_lines:
         _append(lvl, entry)
 
-    # ── Toolbar ───────────────────────────────────────────────────────
     bb = tk.Frame(win, bg=THEME["surface"], pady=8); bb.pack(fill="x")
     bkw = dict(bg=THEME["surface2"], fg=THEME["accent"], font=("Segoe UI", 9),
                relief="flat", bd=0, cursor="hand2", padx=12, pady=5,
@@ -707,7 +800,6 @@ def open_log_window():
         messagebox.showinfo("Copied", "Log copied to clipboard.", parent=win)
 
     def _check_update_manual():
-        """Manual update check triggered from log window toolbar."""
         log("Manual update check requested…", "UPDATE")
         start_update_check(silent=False, parent_win=win)
 
@@ -723,7 +815,6 @@ def open_log_window():
     tk.Label(bb, text="Developed by Mehak Singh | TheMehakCodes",
              font=FONT_CREDIT, fg=THEME["text_dim"], bg=THEME["surface"]).pack(side="right", padx=16)
 
-    # ── Poll queue ────────────────────────────────────────────────────
     def _poll():
         if not _log_win_open: return
         try:
@@ -888,8 +979,6 @@ def _make_tray_image() -> Image.Image:
     draw.text((20, 18), "M", fill="white")
     return img
 
-# ── Tray callbacks (called from pystray thread → schedule on Tk thread) ──
-
 def _tray_show_logs(icon, item):
     get_root().after(0, open_log_window)
 
@@ -919,29 +1008,13 @@ def build_tray() -> pystray.Icon:
             enabled=False,
         ),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(
-            "📋  Show Logs",
-            _tray_show_logs,
-            default=True,
-        ),
-        pystray.MenuItem(
-            "⚙️   Edit Config",
-            _tray_edit_config,
-        ),
-        pystray.MenuItem(
-            "ℹ️   About",
-            _tray_about,
-        ),
+        pystray.MenuItem("📋  Show Logs",       _tray_show_logs,    default=True),
+        pystray.MenuItem("⚙️   Edit Config",     _tray_edit_config),
+        pystray.MenuItem("ℹ️   About",           _tray_about),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(
-            "🔄  Check for Updates",
-            _tray_check_update,
-        ),
+        pystray.MenuItem("🔄  Check for Updates", _tray_check_update),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(
-            "✖  Exit",
-            _tray_exit,
-        ),
+        pystray.MenuItem("✖  Exit",             _tray_exit),
     )
     return pystray.Icon(
         name  = "MargERPAutoPrinter",
@@ -955,20 +1028,11 @@ def build_tray() -> pystray.Icon:
 # ==============================
 
 def main():
-    # 0 — silent background update check on startup
     start_update_check(silent=True)
-
-    # 1 — start dedicated print-queue worker (daemon thread)
     threading.Thread(target=print_worker, daemon=True, name="PrintWorker").start()
-
-    # 2 — start file watcher (daemon thread)
     threading.Thread(target=watcher_loop, daemon=True, name="Watcher").start()
-
-    # 3 — start tray icon (daemon thread)
     tray = build_tray()
     threading.Thread(target=tray.run, daemon=True, name="Tray").start()
-
-    # 4 — Tk event loop on main thread (required by Windows)
     get_root().mainloop()
 
 if __name__ == "__main__":
