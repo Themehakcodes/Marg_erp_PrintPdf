@@ -49,7 +49,7 @@ from PIL import Image, ImageDraw
 # VERSION
 # ==============================
 
-APP_VERSION        = "1.0.4"
+APP_VERSION        = "1.0.5"
 UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Themehakcodes/Marg_erp_PrintPdf/main/version.json"
 
 # ==============================
