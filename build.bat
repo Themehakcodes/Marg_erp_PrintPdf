@@ -1,9 +1,9 @@
+Copy
+
 @echo off
 REM ================================================================
 REM  Marg ERP Auto Printer — Build Script
 REM  Developed by Mehak Singh | TheMehakCodes
-REM  Using --onedir mode to avoid PyInstaller DLL extraction issues
-REM  in protected directories (Program Files)
 REM ================================================================
 
 echo.
@@ -13,29 +13,24 @@ echo  Developed by Mehak Singh ^| TheMehakCodes
 echo ============================================================
 echo.
 
-echo [1/4] Cleaning old build files...
+echo [1/5] Cleaning old build files...
 echo ------------------------------------------------
-if exist build      rmdir /s /q build
+if exist build rmdir /s /q build
 if exist marg_auto_printer.spec del marg_auto_printer.spec
+if exist marg_updater.spec       del marg_updater.spec
 
 echo.
-echo [2/4] Installing / upgrading dependencies...
+echo [2/5] Installing / upgrading dependencies...
 echo ------------------------------------------------
 pip install --upgrade pyinstaller pywin32 pystray pillow requests
 
 echo.
-echo [3/4] Building application (onedir mode)...
+echo [3/5] Building main application (onefile)...
 echo ------------------------------------------------
-
-REM  --onedir  = all DLLs sit beside the EXE permanently
-REM             no _MEI extraction folder, no DLL-load race on startup
-REM             this is the correct solution for apps installed in
-REM             Program Files where the EXE cannot write to its own dir
-
 pyinstaller ^
 --noconfirm ^
 --clean ^
---onedir ^
+--onefile ^
 --windowed ^
 --name marg_auto_printer ^
 --icon logo.ico ^
@@ -59,18 +54,36 @@ pyinstaller ^
 marg_auto_printer.py
 
 echo.
-echo [4/4] Checking build result...
+echo [4/5] Building updater EXE (tiny onefile)...
 echo ------------------------------------------------
+pyinstaller ^
+--noconfirm ^
+--clean ^
+--onefile ^
+--windowed ^
+--name marg_updater ^
+--icon logo.ico ^
+marg_updater.py
 
-if exist "dist\marg_auto_printer\marg_auto_printer.exe" (
-    echo.
-    echo BUILD SUCCESSFUL
-    echo.
-    echo Output folder:
-    echo dist\marg_auto_printer\
-    echo.
-    echo IMPORTANT - Inno Setup change needed ^(see below^)
-    echo.
+echo.
+echo [5/5] Checking build results...
+echo ------------------------------------------------
+if exist "dist\marg_auto_printer.exe" (
+    if exist "dist\marg_updater.exe" (
+        echo.
+        echo BUILD SUCCESSFUL
+        echo.
+        echo Output files:
+        echo   dist\marg_auto_printer.exe   -- main app
+        echo   dist\marg_updater.exe        -- updater (bundle with installer)
+        echo.
+        echo Next steps:
+        echo   1. Copy BOTH EXEs to your InstallerBuild folder
+        echo   2. Compile installer using Inno Setup
+        echo.
+    ) else (
+        echo Main app built but updater FAILED - check errors above.
+    )
 ) else (
     echo.
     echo BUILD FAILED - Check errors above.

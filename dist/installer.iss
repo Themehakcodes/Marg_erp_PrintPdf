@@ -1,5 +1,5 @@
 #define MyAppName "Marg ERP Auto Printer"
-#define MyAppVersion "1.0.8"
+#define MyAppVersion "1.0.9"
 #define MyAppPublisher "TheMehakCodes"
 #define MyAppDeveloper "Mehak Singh"
 #define MyAppURL "https://themehakcodes.com"
@@ -39,17 +39,10 @@ Name: "desktopicon";  Description: "Create a &desktop shortcut";               G
 Name: "startupicon";  Description: "Launch automatically at &Windows startup";  GroupDescription: "Startup:"
 
 [Files]
-; ── Main EXE ────────────────────────────────────────────────────────────────
-Source: "marg_auto_printer\marg_auto_printer.exe"; DestDir: "{app}"; Flags: ignoreversion
-
-; ── All DLLs and support files produced by --onedir ─────────────────────────
-; This single wildcard line copies every file PyInstaller put in the dist folder
-; (python311.dll, all .pyd files, _internal folder, etc.)
-Source: "marg_auto_printer\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-
-; ── Bundled tools ────────────────────────────────────────────────────────────
-Source: "SumatraPDF.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "logo.ico";       DestDir: "{app}"; Flags: ignoreversion
+Source: "marg_auto_printer.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "marg_updater.exe";      DestDir: "{app}"; Flags: ignoreversion
+Source: "SumatraPDF.exe";        DestDir: "{app}"; Flags: ignoreversion
+Source: "logo.ico";              DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}";           Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\logo.ico"
@@ -60,9 +53,6 @@ Name: "{userstartup}\{#MyAppName}";     Filename: "{app}\{#MyAppExeName}"; Tasks
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent runascurrentuser
 
-; ======================================================
-; CUSTOM WIZARD PAGES  —  PRINTER DROPDOWN + CONFIG
-; ======================================================
 [Code]
 
 function InitializeSetup(): Boolean;
@@ -161,7 +151,7 @@ begin
     PrinterCombo.ItemIndex := 0
   else
   begin
-    PrinterCombo.Items.Add('(No printers found – install a printer then click Refresh)');
+    PrinterCombo.Items.Add('(No printers found - install a printer then click Refresh)');
     PrinterCombo.ItemIndex := 0;
   end;
 end;
@@ -190,8 +180,7 @@ begin
     Parent   := PrinterPage.Surface;
     Caption  := 'All printers currently installed on this computer are listed below.' + #13#10 +
                 'Select the one that Marg ERP Auto Printer should send jobs to.';
-    Left     := 0; Top := 0;
-    Width    := PrinterPage.SurfaceWidth;
+    Left := 0; Top := 0; Width := PrinterPage.SurfaceWidth;
     WordWrap := True; AutoSize := True;
   end;
 
@@ -204,17 +193,17 @@ begin
 
   PrinterCombo := TComboBox.Create(WizardForm);
   with PrinterCombo do begin
-    Parent    := PrinterPage.Surface;
-    Left      := 0; Top := 70;
-    Width     := PrinterPage.SurfaceWidth - 110;
-    Style     := csDropDownList;
+    Parent := PrinterPage.Surface;
+    Left := 0; Top := 70;
+    Width := PrinterPage.SurfaceWidth - 110;
+    Style := csDropDownList;
     Font.Size := 9;
   end;
 
   RefreshBtn := TButton.Create(WizardForm);
   with RefreshBtn do begin
     Parent  := PrinterPage.Surface;
-    Caption := '↻  Refresh';
+    Caption := 'Refresh';
     Left    := PrinterCombo.Left + PrinterCombo.Width + 10;
     Top     := PrinterCombo.Top - 1;
     Width   := 95;
@@ -225,11 +214,10 @@ begin
   Lbl := TLabel.Create(WizardForm);
   with Lbl do begin
     Parent     := PrinterPage.Surface;
-    Caption    := 'Tip: If your printer is missing, install it via Windows Settings → Printers & Scanners, then click Refresh.';
-    Left       := 0;
-    Top        := PrinterCombo.Top + PrinterCombo.Height + 12;
-    Width      := PrinterPage.SurfaceWidth;
-    WordWrap   := True; AutoSize := True;
+    Caption    := 'Tip: If your printer is missing, install it in Windows Settings then click Refresh.';
+    Left := 0; Top := PrinterCombo.Top + PrinterCombo.Height + 12;
+    Width := PrinterPage.SurfaceWidth;
+    WordWrap := True; AutoSize := True;
     Font.Color := $00666666; Font.Size := 8;
   end;
 
@@ -237,26 +225,26 @@ begin
 
   FolderPage := CreateInputDirPage(PrinterPage.ID,
     'Watch Folder', 'Select Folder to Monitor',
-    'Choose the folder where PDF files will be detected and automatically sent to the printer.',
+    'Choose the folder where PDF files will be detected and sent to the printer.',
     False, '');
   FolderPage.Add('');
 
   PrefixPage := CreateInputQueryPage(FolderPage.ID,
     'File Prefix Filter', 'Set PDF File Prefix',
-    'Only PDF files whose names begin with this prefix will be printed (e.g. MC_PRINT).' + #13#10 +
+    'Only PDF files whose names begin with this prefix will be printed.' + #13#10 +
     'Leave blank to print ALL PDF files in the watch folder.');
   PrefixPage.Add('File Prefix:', False);
   PrefixPage.Values[0] := 'MC_PRINT';
 
   IntervalPage := CreateInputQueryPage(PrefixPage.ID,
     'Check Interval', 'Set Folder Polling Interval',
-    'How frequently (in seconds) should the app scan the watch folder for new PDF files?');
+    'How frequently (in seconds) should the app scan the watch folder?');
   IntervalPage.Add('Interval (seconds):', False);
   IntervalPage.Values[0] := '5';
 
   SilentPage := CreateInputOptionPage(IntervalPage.ID,
     'Silent Mode', 'Enable Silent / Background Printing',
-    'When enabled, the application prints in the background without any dialogs or notifications.',
+    'When enabled, the application prints in the background without any dialogs.',
     False, False);
   SilentPage.Add('Enable Silent Mode (recommended for automated use)');
   SilentPage.Values[0] := True;
@@ -271,9 +259,7 @@ begin
     if (PrinterCombo.Items.Count = 0) or
        (Pos('No printers found', PrinterCombo.Items[PrinterCombo.ItemIndex]) > 0) then
     begin
-      MsgBox('Please select a valid printer before continuing.' + #13#10 +
-             'If none appear, install a printer in Windows and click Refresh.',
-             mbError, MB_OK);
+      MsgBox('Please select a valid printer before continuing.', mbError, MB_OK);
       Result := False; Exit;
     end;
   end;
