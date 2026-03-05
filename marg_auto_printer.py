@@ -49,7 +49,7 @@ from PIL import Image, ImageDraw
 # VERSION
 # ==============================
 
-APP_VERSION        = "1.0.7"
+APP_VERSION        = "1.0.8"
 UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Themehakcodes/Marg_erp_PrintPdf/main/version.json"
 
 # ==============================
@@ -250,7 +250,7 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
     # ── Write updater batch ───────────────────────────────────────
     bat_path = os.path.join(app_dir, "_marg_updater.bat")
     pid      = os.getpid()
-    bat_contents = (
+      bat_contents = (
         "@echo off\n"
         "setlocal\n"
         # Wait until our PID disappears (poll every 500 ms, max ~30 s)
@@ -260,8 +260,15 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
         "    ping 127.0.0.1 -n 1 -w 500 >nul\n"
         "    goto wait\n"
         ")\n"
+        # Extra pause — lets Windows fully release file handles on the
+        # old EXE and its PyInstaller temp-extraction DLLs.
+        # "ping -n 4" = ~3 seconds of wall-clock wait.
+        "ping 127.0.0.1 -n 4 >nul\n"
         # Replace exe
         f'move /Y "{update_path}" "{current_exe}" >nul 2>&1\n'
+        # Brief pause after move so the NTFS rename is fully flushed
+        # before the new process tries to open the same path.
+        "ping 127.0.0.1 -n 2 >nul\n"
         # Restart silently
         f'start "" "{current_exe}"\n'
         # Self-delete
