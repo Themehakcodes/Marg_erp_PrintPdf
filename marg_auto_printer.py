@@ -49,7 +49,7 @@ from PIL import Image, ImageDraw
 # VERSION
 # ==============================
 
-APP_VERSION        = "1.0.8"
+APP_VERSION        = "1.0.9"
 UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Themehakcodes/Marg_erp_PrintPdf/main/version.json"
 
 # ==============================
@@ -192,14 +192,22 @@ def _parse_version(v: str):
 
 def _apply_direct_update(exe_url: str, remote_ver: str,
                           remote_sha: str, silent: bool, parent_win):
-    import urllib.request, hashlib
+    """
+    DIRECT update flow for --onedir builds.
+    Downloads a .zip containing the full onedir folder,
+    extracts it over the current install directory.
+    
+    version.json should point exe_url to a ZIP, not a bare EXE.
+    ZIP structure expected:  marg_auto_printer/<all files>
+    """
+    import urllib.request, hashlib, zipfile, tempfile
 
     current_exe = sys.executable if getattr(sys, "frozen", False) \
                   else os.path.abspath(__file__)
     app_dir     = os.path.dirname(current_exe)
-    update_path = os.path.join(app_dir, "update_new.exe")
+    update_zip  = os.path.join(app_dir, "update_new.zip")
 
-    log("Downloading direct EXE update silently…", "UPDATE")
+    log("Downloading update package…", "UPDATE")
 
     dl_req = urllib.request.Request(
         exe_url,
@@ -207,7 +215,7 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
     )
     hasher = hashlib.sha256()
     with urllib.request.urlopen(dl_req, timeout=180) as dl_resp, \
-         open(update_path, "wb") as out_f:
+         open(update_zip, "wb") as out_f:
         while True:
             chunk = dl_resp.read(65536)
             if not chunk:
@@ -215,9 +223,9 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
             out_f.write(chunk)
             hasher.update(chunk)
 
-    if os.path.getsize(update_path) < 100_000:
+    if os.path.getsize(update_zip) < 100_000:
         log("Downloaded file too small — aborting update.", "ERROR")
-        try: os.remove(update_path)
+        try: os.remove(update_zip)
         except Exception: pass
         return
 
@@ -225,44 +233,56 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
         actual_sha = hasher.hexdigest().lower()
         if actual_sha != remote_sha.lower():
             log(f"Checksum mismatch — aborting. Got: {actual_sha}", "ERROR")
-            try: os.remove(update_path)
+            try: os.remove(update_zip)
             except Exception: pass
             return
         log("SHA-256 checksum verified ✔", "SUCCESS")
 
-    log(f"Download complete. Installing v{remote_ver} silently…", "UPDATE")
+    log(f"Download complete. Installing v{remote_ver}…", "UPDATE")
 
     bat_path = os.path.join(app_dir, "_marg_updater.bat")
     pid      = os.getpid()
+
     bat_contents = (
         "@echo off\n"
         "setlocal\n"
+        # ── Wait for old process to exit ──────────────────────────────
         f":wait\n"
         f'tasklist /FI "PID eq {pid}" 2>nul | find /I "{pid}" >nul\n'
         "if not errorlevel 1 (\n"
         "    ping 127.0.0.1 -n 1 -w 500 >nul\n"
         "    goto wait\n"
         ")\n"
+        # ── 3 second buffer for handle release ───────────────────────
         "ping 127.0.0.1 -n 4 >nul\n"
-        f'move /Y "{update_path}" "{current_exe}" >nul 2>&1\n'
+        # ── Extract ZIP over install dir using PowerShell ─────────────
+        # Expand-Archive with -Force overwrites all existing files
+        f'powershell.exe -NoProfile -WindowStyle Hidden -Command "'
+        f'Expand-Archive -Path \\"{update_zip}\\" '
+        f'-DestinationPath \\"{app_dir}\\" -Force"\n'
+        # ── 1 second buffer after extraction ─────────────────────────
         "ping 127.0.0.1 -n 2 >nul\n"
+        # ── Restart ──────────────────────────────────────────────────
         f'start "" "{current_exe}"\n'
+        # ── Cleanup ──────────────────────────────────────────────────
+        f'del /Q "{update_zip}" 2>nul\n'
         "(goto) 2>nul & del \"%~f0\"\n"
     )
+
     with open(bat_path, "w") as f:
         f.write(bat_contents)
 
     protected = (
-        os.environ.get("ProgramFiles", "C:\\Program Files"),
+        os.environ.get("ProgramFiles",      "C:\\Program Files"),
         os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
-        os.environ.get("SystemRoot", "C:\\Windows"),
+        os.environ.get("SystemRoot",        "C:\\Windows"),
     )
     needs_elevation = any(
         app_dir.lower().startswith(p.lower()) for p in protected if p
     )
 
     if needs_elevation:
-        log("Install dir is protected — requesting UAC elevation for updater…", "UPDATE")
+        log("Install dir is protected — requesting UAC elevation…", "UPDATE")
         ps_cmd = (
             f'Start-Process cmd.exe '
             f'-ArgumentList \'/C "{bat_path}"\' '
@@ -282,7 +302,6 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
         )
 
     log("Updater launched — restarting now…", "UPDATE")
-
     stop_event.set()
     get_root().after(0, get_root().destroy)
     

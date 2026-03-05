@@ -1,7 +1,0 @@
-{
-    "printer": "Microsoft Print to PDF",
-    "watch_folder": "C:\\Users\\KC\\Downloads",
-    "file_prefix": "MC_PRINT",
-    "check_interval": 2,
-    "silent_mode": true
-}

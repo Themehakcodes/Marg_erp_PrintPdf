@@ -1,5 +1,5 @@
 #define MyAppName "Marg ERP Auto Printer"
-#define MyAppVersion "1.0.7"
+#define MyAppVersion "1.0.8"
 #define MyAppPublisher "TheMehakCodes"
 #define MyAppDeveloper "Mehak Singh"
 #define MyAppURL "https://themehakcodes.com"
@@ -29,13 +29,6 @@ VersionInfoVersion={#MyAppVersion}
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription={#MyAppName} Installer
 VersionInfoCopyright=Developed by {#MyAppDeveloper} @ {#MyAppPublisher}
-
-; ============================================================
-;  ADMIN PRIVILEGES — forces UAC prompt on launch
-;  PrivilegesRequired=admin  → installer demands elevation
-;  PrivilegesRequiredOverridesAllowed is intentionally omitted
-;  so the user cannot bypass the UAC prompt
-; ============================================================
 PrivilegesRequired=admin
 
 [Languages]
@@ -46,9 +39,17 @@ Name: "desktopicon";  Description: "Create a &desktop shortcut";               G
 Name: "startupicon";  Description: "Launch automatically at &Windows startup";  GroupDescription: "Startup:"
 
 [Files]
-Source: "marg_auto_printer.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "SumatraPDF.exe";        DestDir: "{app}"; Flags: ignoreversion
-Source: "logo.ico";              DestDir: "{app}"; Flags: ignoreversion
+; ── Main EXE ────────────────────────────────────────────────────────────────
+Source: "marg_auto_printer\marg_auto_printer.exe"; DestDir: "{app}"; Flags: ignoreversion
+
+; ── All DLLs and support files produced by --onedir ─────────────────────────
+; This single wildcard line copies every file PyInstaller put in the dist folder
+; (python311.dll, all .pyd files, _internal folder, etc.)
+Source: "marg_auto_printer\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+; ── Bundled tools ────────────────────────────────────────────────────────────
+Source: "SumatraPDF.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "logo.ico";       DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}";           Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\logo.ico"
@@ -57,7 +58,6 @@ Name: "{autodesktop}\{#MyAppName}";     Filename: "{app}\{#MyAppExeName}"; IconF
 Name: "{userstartup}\{#MyAppName}";     Filename: "{app}\{#MyAppExeName}"; Tasks: startupicon
 
 [Run]
-; Run the app after install — also elevated so it can write config.json to Program Files
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent runascurrentuser
 
 ; ======================================================
@@ -65,10 +65,6 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: no
 ; ======================================================
 [Code]
 
-{ ------------------------------------------------------------------ }
-{  Check for admin rights at startup — abort if not elevated          }
-{  (belt-and-suspenders on top of PrivilegesRequired=admin)           }
-{ ------------------------------------------------------------------ }
 function InitializeSetup(): Boolean;
 begin
   Result := True;
@@ -83,39 +79,26 @@ begin
   end;
 end;
 
-{ ------------------------------------------------------------------ }
-{  Global variables                                                    }
-{ ------------------------------------------------------------------ }
 var
   PrinterPage  : TWizardPage;
   PrinterCombo : TComboBox;
   RefreshBtn   : TButton;
-
   FolderPage   : TInputDirWizardPage;
   PrefixPage   : TInputQueryWizardPage;
   IntervalPage : TInputQueryWizardPage;
   SilentPage   : TInputOptionWizardPage;
 
-{ ------------------------------------------------------------------ }
-{  Helper: Boolean -> JSON literal                                     }
-{ ------------------------------------------------------------------ }
 function BoolToJsonStr(B: Boolean): String;
 begin
   if B then Result := 'true' else Result := 'false';
 end;
 
-{ ------------------------------------------------------------------ }
-{  Helper: escape backslashes for JSON strings                         }
-{ ------------------------------------------------------------------ }
 function EscapeBackslashes(S: String): String;
 begin
   StringChangeEx(S, '\', '\\', True);
   Result := S;
 end;
 
-{ ------------------------------------------------------------------ }
-{  Helper: validate positive integer                                   }
-{ ------------------------------------------------------------------ }
 function IsPositiveInteger(S: String): Boolean;
 var
   I, N: Integer;
@@ -131,9 +114,6 @@ begin
   Result := (N > 0);
 end;
 
-{ ------------------------------------------------------------------ }
-{  Populate PrinterCombo via PowerShell (primary) + WMIC (fallback)   }
-{ ------------------------------------------------------------------ }
 procedure PopulatePrinters;
 var
   TempFile   : String;
@@ -145,7 +125,6 @@ begin
   PrinterCombo.Items.Clear;
   TempFile := ExpandConstant('{tmp}\printers_list.txt');
 
-  { Primary: PowerShell Get-Printer }
   Exec(
     ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
     '-NoProfile -NonInteractive -Command ' +
@@ -162,7 +141,6 @@ begin
         PrinterCombo.Items.Add(Line);
     end;
 
-  { Fallback: WMIC }
   if PrinterCombo.Items.Count = 0 then
   begin
     Exec(
@@ -188,9 +166,6 @@ begin
   end;
 end;
 
-{ ------------------------------------------------------------------ }
-{  Refresh button handler                                              }
-{ ------------------------------------------------------------------ }
 procedure OnRefreshClick(Sender: TObject);
 begin
   PopulatePrinters;
@@ -202,14 +177,10 @@ begin
            mbError, MB_OK);
 end;
 
-{ ------------------------------------------------------------------ }
-{  Build all wizard pages                                              }
-{ ------------------------------------------------------------------ }
 procedure InitializeWizard;
 var
   Lbl : TLabel;
 begin
-  { PAGE 1 – Printer Selection }
   PrinterPage := CreateCustomPage(wpWelcome,
     'Printer Configuration',
     'Select the printer for automatic PDF printing.');
@@ -264,14 +235,12 @@ begin
 
   PopulatePrinters;
 
-  { PAGE 2 – Watch Folder }
   FolderPage := CreateInputDirPage(PrinterPage.ID,
     'Watch Folder', 'Select Folder to Monitor',
     'Choose the folder where PDF files will be detected and automatically sent to the printer.',
     False, '');
   FolderPage.Add('');
 
-  { PAGE 3 – File Prefix }
   PrefixPage := CreateInputQueryPage(FolderPage.ID,
     'File Prefix Filter', 'Set PDF File Prefix',
     'Only PDF files whose names begin with this prefix will be printed (e.g. MC_PRINT).' + #13#10 +
@@ -279,14 +248,12 @@ begin
   PrefixPage.Add('File Prefix:', False);
   PrefixPage.Values[0] := 'MC_PRINT';
 
-  { PAGE 4 – Check Interval }
   IntervalPage := CreateInputQueryPage(PrefixPage.ID,
     'Check Interval', 'Set Folder Polling Interval',
     'How frequently (in seconds) should the app scan the watch folder for new PDF files?');
   IntervalPage.Add('Interval (seconds):', False);
   IntervalPage.Values[0] := '5';
 
-  { PAGE 5 – Silent Mode }
   SilentPage := CreateInputOptionPage(IntervalPage.ID,
     'Silent Mode', 'Enable Silent / Background Printing',
     'When enabled, the application prints in the background without any dialogs or notifications.',
@@ -295,9 +262,6 @@ begin
   SilentPage.Values[0] := True;
 end;
 
-{ ------------------------------------------------------------------ }
-{  Validation on Next click                                            }
-{ ------------------------------------------------------------------ }
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
@@ -334,9 +298,6 @@ begin
   end;
 end;
 
-{ ------------------------------------------------------------------ }
-{  Write config.json after install                                     }
-{ ------------------------------------------------------------------ }
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ConfigFile      : String;
@@ -366,9 +327,6 @@ begin
   end;
 end;
 
-{ ------------------------------------------------------------------ }
-{  Finish page summary                                                 }
-{ ------------------------------------------------------------------ }
 procedure CurPageChanged(CurPageID: Integer);
 var
   SelectedPrinter : String;
