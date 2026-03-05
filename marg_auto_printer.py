@@ -49,7 +49,7 @@ from PIL import Image, ImageDraw
 # VERSION
 # ==============================
 
-APP_VERSION        = "1.0.5"
+APP_VERSION        = "1.0.7"
 UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Themehakcodes/Marg_erp_PrintPdf/main/version.json"
 
 # ==============================
@@ -270,12 +270,40 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
     with open(bat_path, "w") as f:
         f.write(bat_contents)
 
-    # ── Launch bat fully detached & hidden ────────────────────────
-    subprocess.Popen(
-        ["cmd.exe", "/C", bat_path],
-        creationflags=(subprocess.DETACHED_PROCESS |
-                       subprocess.CREATE_NO_WINDOW),
+    # ── Launch bat — elevated if in a protected directory ────────
+    # Paths under Program Files require admin rights to overwrite files.
+    # We detect this and use PowerShell Start-Process -Verb RunAs to
+    # trigger a UAC prompt, then do a clean shutdown so the bat's
+    # PID-wait loop actually fires.
+    protected = (
+        os.environ.get("ProgramFiles", "C:\\Program Files"),
+        os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+        os.environ.get("SystemRoot", "C:\\Windows"),
     )
+    needs_elevation = any(
+        app_dir.lower().startswith(p.lower()) for p in protected if p
+    )
+
+    if needs_elevation:
+        log("Install dir is protected — requesting UAC elevation for updater…", "UPDATE")
+        # PowerShell: Start-Process cmd -ArgumentList '/C <bat>' -Verb RunAs -WindowStyle Hidden
+        ps_cmd = (
+            f'Start-Process cmd.exe '
+            f'-ArgumentList \'/C "{bat_path}"\' '
+            f'-Verb RunAs '
+            f'-WindowStyle Hidden'
+        )
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden",
+             "-Command", ps_cmd],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    else:
+        subprocess.Popen(
+            ["cmd.exe", "/C", bat_path],
+            creationflags=(subprocess.DETACHED_PROCESS |
+                           subprocess.CREATE_NO_WINDOW),
+        )
 
     log("Updater launched — restarting now…", "UPDATE")
 
