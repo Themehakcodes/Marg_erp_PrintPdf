@@ -192,18 +192,6 @@ def _parse_version(v: str):
 
 def _apply_direct_update(exe_url: str, remote_ver: str,
                           remote_sha: str, silent: bool, parent_win):
-    """
-    DIRECT EXE update flow  (release_type == "direct")
-    ─────────────────────────────────────────────────
-    1. Download new .exe → update_new.exe (same folder)
-    2. Validate size + optional SHA-256
-    3. Write _marg_updater.bat that:
-         • waits for THIS process to exit (PID-poll, no fixed delay)
-         • moves update_new.exe over current exe
-         • restarts the new exe silently
-         • self-deletes
-    4. Launch bat detached → clean sys.exit() so bat's wait fires
-    """
     import urllib.request, hashlib
 
     current_exe = sys.executable if getattr(sys, "frozen", False) \
@@ -213,7 +201,6 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
 
     log("Downloading direct EXE update silently…", "UPDATE")
 
-    # ── Download ──────────────────────────────────────────────────
     dl_req = urllib.request.Request(
         exe_url,
         headers={"User-Agent": "MargERPAutoPrinter-Updater"}
@@ -228,14 +215,12 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
             out_f.write(chunk)
             hasher.update(chunk)
 
-    # ── Size guard ────────────────────────────────────────────────
     if os.path.getsize(update_path) < 100_000:
         log("Downloaded file too small — aborting update.", "ERROR")
         try: os.remove(update_path)
         except Exception: pass
         return
 
-    # ── Optional SHA-256 validation ───────────────────────────────
     if remote_sha:
         actual_sha = hasher.hexdigest().lower()
         if actual_sha != remote_sha.lower():
@@ -247,41 +232,26 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
 
     log(f"Download complete. Installing v{remote_ver} silently…", "UPDATE")
 
-    # ── Write updater batch ───────────────────────────────────────
     bat_path = os.path.join(app_dir, "_marg_updater.bat")
     pid      = os.getpid()
-      bat_contents = (
+    bat_contents = (
         "@echo off\n"
         "setlocal\n"
-        # Wait until our PID disappears (poll every 500 ms, max ~30 s)
         f":wait\n"
         f'tasklist /FI "PID eq {pid}" 2>nul | find /I "{pid}" >nul\n'
         "if not errorlevel 1 (\n"
         "    ping 127.0.0.1 -n 1 -w 500 >nul\n"
         "    goto wait\n"
         ")\n"
-        # Extra pause — lets Windows fully release file handles on the
-        # old EXE and its PyInstaller temp-extraction DLLs.
-        # "ping -n 4" = ~3 seconds of wall-clock wait.
         "ping 127.0.0.1 -n 4 >nul\n"
-        # Replace exe
         f'move /Y "{update_path}" "{current_exe}" >nul 2>&1\n'
-        # Brief pause after move so the NTFS rename is fully flushed
-        # before the new process tries to open the same path.
         "ping 127.0.0.1 -n 2 >nul\n"
-        # Restart silently
         f'start "" "{current_exe}"\n'
-        # Self-delete
         "(goto) 2>nul & del \"%~f0\"\n"
     )
     with open(bat_path, "w") as f:
         f.write(bat_contents)
 
-    # ── Launch bat — elevated if in a protected directory ────────
-    # Paths under Program Files require admin rights to overwrite files.
-    # We detect this and use PowerShell Start-Process -Verb RunAs to
-    # trigger a UAC prompt, then do a clean shutdown so the bat's
-    # PID-wait loop actually fires.
     protected = (
         os.environ.get("ProgramFiles", "C:\\Program Files"),
         os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
@@ -293,7 +263,6 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
 
     if needs_elevation:
         log("Install dir is protected — requesting UAC elevation for updater…", "UPDATE")
-        # PowerShell: Start-Process cmd -ArgumentList '/C <bat>' -Verb RunAs -WindowStyle Hidden
         ps_cmd = (
             f'Start-Process cmd.exe '
             f'-ArgumentList \'/C "{bat_path}"\' '
@@ -314,11 +283,9 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
 
     log("Updater launched — restarting now…", "UPDATE")
 
-    # ── Clean shutdown so the bat's PID-wait loop actually fires ──
     stop_event.set()
     get_root().after(0, get_root().destroy)
-
-
+    
 def _apply_installer_update(exe_url: str, remote_ver: str,
                              remote_sha: str, silent: bool, parent_win):
     """
