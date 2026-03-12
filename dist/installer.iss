@@ -1,5 +1,5 @@
-#define MyAppName "Marg ERP Auto Printer"
-#define MyAppVersion "1.0.9"
+#define MyAppName "Marg ERP Auto Printer (Beta)"
+#define MyAppVersion "1.2.3"
 #define MyAppPublisher "TheMehakCodes"
 #define MyAppDeveloper "Mehak Singh"
 #define MyAppURL "https://themehakcodes.com"

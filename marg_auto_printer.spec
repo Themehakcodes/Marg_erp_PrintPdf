@@ -1,16 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('logo.ico', '.'), ('logo.png', '.')]
+datas = [('logo.ico', '.'), ('logo.png', '.'), ('SumatraPDF.exe', '.')]
 binaries = []
-hiddenimports = ['win32print', 'win32api', 'win32con', 'pystray._win32', 'PIL._imaging', 'PIL.Image', 'requests', 'urllib3', 'certifi', 'charset_normalizer', 'idna']
+hiddenimports = ['win32api', 'win32con', 'win32event', 'win32file', 'win32gui', 'win32process', 'pystray', 'pystray._win32', 'PIL', 'PIL._imaging', 'PIL.Image', 'PIL.ImageDraw', 'queue', 'threading', 'logging', 'logging.handlers', 'urllib.request', 'hashlib', 'json', 'datetime', 'tkinter', 'tkinter.ttk', 'tkinter.filedialog', 'tkinter.messagebox']
 tmp_ret = collect_all('win32print')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('win32api')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('win32event')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('pystray')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('PIL')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('tkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
@@ -23,7 +27,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['matplotlib', 'numpy', 'pandas', 'scipy', 'PyQt5', 'PySide2'],
     noarchive=False,
     optimize=0,
 )
