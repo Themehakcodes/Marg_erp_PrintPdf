@@ -42,6 +42,7 @@ Name: "startupicon";  Description: "Launch automatically at &Windows startup";  
 Source: "marg_auto_printer.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "marg_updater.exe";      DestDir: "{app}"; Flags: ignoreversion
 Source: "SumatraPDF.exe";        DestDir: "{app}"; Flags: ignoreversion
+Source: "PDFtoPrinter_m.exe";    DestDir: "{app}"; Flags: ignoreversion  
 Source: "logo.ico";              DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
@@ -77,6 +78,7 @@ var
   PrefixPage   : TInputQueryWizardPage;
   IntervalPage : TInputQueryWizardPage;
   SilentPage   : TInputOptionWizardPage;
+  FastModePage : TInputOptionWizardPage;  // NEW: Fast Mode page
 
 function BoolToJsonStr(B: Boolean): String;
 begin
@@ -248,6 +250,15 @@ begin
     False, False);
   SilentPage.Add('Enable Silent Mode (recommended for automated use)');
   SilentPage.Values[0] := True;
+
+  // NEW: Fast Mode Page
+  FastModePage := CreateInputOptionPage(SilentPage.ID,
+    'Fast Mode', 'Enable Fast Printing',
+    'Fast Mode prints immediately without validation (2-3 seconds faster).' + #13#10 +
+    'Disable only if you experience corrupted PDFs.',
+    False, False);
+  FastModePage.Add('Enable Fast Mode (Recommended for speed)');
+  FastModePage.Values[0] := True;  // Default to ON
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -304,6 +315,9 @@ begin
       '    "file_prefix": "'   + PrefixPage.Values[0]                    + '",'   + #13#10 +
       '    "check_interval": ' + Trim(IntervalPage.Values[0])             + ','   + #13#10 +
       '    "silent_mode": '    + BoolToJsonStr(SilentPage.Values[0])      + ','   + #13#10 +
+      '    "force_portrait": false,'                                               + #13#10 +
+      '    "use_pdftoprinter": true,'                                              + #13#10 +
+      '    "fast_mode": '      + BoolToJsonStr(FastModePage.Values[0])    + ','   + #13#10 +  // NEW: Fast Mode
       '    "developer": "Mehak Singh",'                                            + #13#10 +
       '    "company": "TheMehakCodes",'                                            + #13#10 +
       '    "version": "1.0"'                                                       + #13#10 +
@@ -316,20 +330,27 @@ end;
 procedure CurPageChanged(CurPageID: Integer);
 var
   SelectedPrinter : String;
+  FastModeText : String;
 begin
   if CurPageID = wpFinished then
   begin
     SelectedPrinter := '(none selected)';
     if PrinterCombo.Items.Count > 0 then
       SelectedPrinter := PrinterCombo.Items[PrinterCombo.ItemIndex];
+    
+    if FastModePage.Values[0] then
+      FastModeText := 'ON'
+    else
+      FastModeText := 'OFF';
 
     WizardForm.FinishedLabel.Caption :=
       'Marg ERP Auto Printer has been successfully installed!'   + #13#10 + #13#10 +
       'Configuration saved:'                                     + #13#10 +
-      '  Printer  :  ' + SelectedPrinter                        + #13#10 +
-      '  Folder   :  ' + FolderPage.Values[0]                   + #13#10 +
-      '  Prefix   :  ' + PrefixPage.Values[0]                   + #13#10 +
-      '  Interval :  ' + IntervalPage.Values[0] + ' seconds'    + #13#10 + #13#10 +
+      '  Printer   :  ' + SelectedPrinter                        + #13#10 +
+      '  Folder    :  ' + FolderPage.Values[0]                   + #13#10 +
+      '  Prefix    :  ' + PrefixPage.Values[0]                   + #13#10 +
+      '  Interval  :  ' + IntervalPage.Values[0] + ' seconds'    + #13#10 +
+      '  Fast Mode :  ' + FastModeText                           + #13#10 + #13#10 +  // NEW: Show Fast Mode status
       'Developed by Mehak Singh  |  TheMehakCodes'              + #13#10 +
       'https://themehakcodes.com';
   end;

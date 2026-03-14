@@ -1,7 +1,7 @@
 # ============================================================
 #  Marg ERP Auto Printer
 #  Developed by Mehak Singh | TheMehakCodes
-#  Version: 1.2.2 (Enhanced Stability Release)
+#  Version: 1.4.2 - No Timeouts, Just Print
 # ============================================================
 #
 #  IMPORTANT — HOW THE WINDOW IS HIDDEN:
@@ -15,8 +15,7 @@
 #  • "installer" → downloaded Setup.exe is launched for the user to run
 # ============================================================
 
-import ctypes
-import sys
+import ctypes, sys
 
 # ── Hide console window immediately (belt-and-suspenders) ──────────
 def _hide_console():
@@ -30,26 +29,6 @@ def _hide_console():
 
 _hide_console()
 
-# ── Single instance check (prevents multiple copies) ───────────────
-def ensure_single_instance():
-    """Ensure only one instance of the application runs"""
-    try:
-        import win32event
-        import win32api
-        import winerror
-        
-        mutex_name = "MargERPAutoPrinter_SingleInstance_Mutex"
-        mutex = win32event.CreateMutex(None, False, mutex_name)
-        last_error = win32api.GetLastError()
-        
-        if last_error == winerror.ERROR_ALREADY_EXISTS:
-            # Another instance is running - silently exit
-            sys.exit(0)
-    except:
-        pass
-
-ensure_single_instance()
-
 # ── Now safe to import everything else ─────────────────────────────
 import os
 import time
@@ -59,23 +38,19 @@ import threading
 import queue
 import win32print
 import win32api
-import win32event
-#import win32spool
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 import hashlib
-import urllib.request
-from PIL import Image, ImageDraw
+
 import pystray
-import logging
-from logging.handlers import RotatingFileHandler
+from PIL import Image, ImageDraw
 
 # ==============================
 # VERSION
 # ==============================
 
-APP_VERSION        = "1.2.3"
+APP_VERSION        = "1.4.2"
 UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Themehakcodes/Marg_erp_PrintPdf/main/version.json"
 
 # ==============================
@@ -89,56 +64,17 @@ else:
 
 CONFIG_FILE  = os.path.join(BASE_DIR, "config.json")
 SUMATRA_PATH = os.path.join(BASE_DIR, "SumatraPDF.exe")
+PDFTOPRINTER_PATH = os.path.join(BASE_DIR, "PDFtoPrinter_m.exe")
 ICON_PATH    = os.path.join(BASE_DIR, "logo.ico")
-LOG_FILE     = os.path.join(BASE_DIR, "marg_printer.log")
+CORRUPTED_FOLDER = os.path.join(BASE_DIR, "corrupted_pdfs")
 
 # ==============================
-# GLOBAL VARIABLES
+# GLOBAL LOG QUEUE  (thread-safe)
 # ==============================
 
-log_queue          = queue.Queue()
-log_lines          = []              # (level, text)  — full in-memory history
-MAX_LOGS           = 500
-
-# Printer queue management (AUTO ONLY - no user options)
-LAST_PRINTER_CLEAR = 0
-PRINTER_CLEAR_COOLDOWN = 300  # 5 minutes between automatic clears
-MAX_CONSECUTIVE_FAILURES = 3
-
-# Processed files tracking (prevents duplicates)
-PROCESSED_FILES = {}  # filename -> timestamp
-PROCESSED_EXPIRY = 30  # seconds
-MAX_PROCESSED_FILES = 1000  # Maximum entries
-
-# Thread management
-_print_queue = queue.Queue()
-_queued_files = set()
-_queued_lock = threading.Lock()
-stop_event = threading.Event()
-
-# ==============================
-# FILE LOGGING SETUP
-# ==============================
-
-def setup_file_logging():
-    """Setup file-based logging with rotation"""
-    logger = logging.getLogger('MargPrinter')
-    logger.setLevel(logging.INFO)
-    
-    # Remove existing handlers
-    logger.handlers.clear()
-    
-    # Create rotating file handler
-    handler = RotatingFileHandler(
-        LOG_FILE, maxBytes=5*1024*1024, backupCount=3  # 5MB per file, 3 backups
-    )
-    handler.setFormatter(logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s'
-    ))
-    logger.addHandler(handler)
-    return logger
-
-file_logger = setup_file_logging()
+log_queue  = queue.Queue()
+log_lines  = []              # (level, text)  — full in-memory history
+MAX_LOGS   = 500
 
 # ==============================
 # THEME
@@ -191,17 +127,6 @@ def log(msg, level="INFO"):
     if len(log_lines) > MAX_LOGS:
         log_lines.pop(0)
     log_queue.put((level, entry))
-    
-    # Also log to file
-    try:
-        if level == "ERROR":
-            file_logger.error(msg)
-        elif level == "WARN":
-            file_logger.warning(msg)
-        else:
-            file_logger.info(msg)
-    except:
-        pass
 
 # ==============================
 # DEFAULT CONFIG
@@ -213,6 +138,9 @@ DEFAULT_CONFIG = {
     "file_prefix":    "Marg_erp",
     "check_interval": 3,
     "silent_mode":    True,
+    "force_portrait": False,
+    "use_pdftoprinter": True,
+    "fast_mode":      True,
 }
 
 # ==============================
@@ -257,173 +185,67 @@ def _combo_style():
     )
 
 # ==============================
-# PRINTER UTILITY FUNCTIONS (AUTO ONLY)
+# PDF VALIDATION FUNCTION
 # ==============================
 
-def get_printer_status_detailed(printer_name):
-    """Check if printer is ready and get detailed status (internal use only)"""
+def validate_pdf_file(file_path):
+    """Check if PDF file is valid and has content"""
     try:
-        hprinter = win32print.OpenPrinter(printer_name)
-        printer_info = win32print.GetPrinter(hprinter, 2)
-        
-        # Get job count
-        jobs = win32print.EnumJobs(hprinter, 0, -1, 1)
-        job_count = len(jobs) if jobs else 0
-        
-        win32print.ClosePrinter(hprinter)
-        
-        status = printer_info['Status']
-        if status == 0:
-            return True, "Ready", job_count
-        elif status & win32print.PRINTER_STATUS_PAUSED:
-            return False, "Paused", job_count
-        elif status & win32print.PRINTER_STATUS_ERROR:
-            return False, "Error", job_count
-        elif status & win32print.PRINTER_STATUS_PAPER_JAM:
-            return False, "Paper Jam", job_count
-        elif status & win32print.PRINTER_STATUS_PAPER_OUT:
-            return False, "Out of Paper", job_count
-        elif status & win32print.PRINTER_STATUS_OFFLINE:
-            return False, "Offline", job_count
-        elif status & win32print.PRINTER_STATUS_BUSY:
-            return False, "Busy", job_count
-        else:
-            return True, "Ready", job_count
-    except:
-        return False, "Cannot Access Printer", 0
-
-def clear_windows_spooler():
-    """Clear Windows print spooler service cache (auto internal only)"""
-    try:
-        # Stop spooler service
-        subprocess.run(
-            ["net", "stop", "spooler", "/y"],
-            capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        time.sleep(2)
-        
-        # Clear spooler folder
-        spool_path = os.path.join(os.environ.get('SYSTEMROOT', 'C:\\Windows'), 
-                                  'System32', 'spool', 'PRINTERS')
-        if os.path.exists(spool_path):
-            for file in os.listdir(spool_path):
-                try:
-                    os.remove(os.path.join(spool_path, file))
-                except:
-                    pass
-        
-        # Start spooler service
-        subprocess.run(
-            ["net", "start", "spooler"],
-            capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        
-        time.sleep(2)
-        return True
-    except:
-        return False
-
-def auto_clear_printer_queue(printer_name):
-    """
-    Automatically clear printer queue when needed (internal only - no user interaction)
-    """
-    global LAST_PRINTER_CLEAR
-    
-    current_time = time.time()
-    if (current_time - LAST_PRINTER_CLEAR) < PRINTER_CLEAR_COOLDOWN:
-        return False
-    
-    try:
-        hprinter = win32print.OpenPrinter(printer_name)
-        jobs = win32print.EnumJobs(hprinter, 0, -1, 1)
-        
-        if jobs:
-            cleared_count = 0
-            for job in jobs:
-                try:
-                    win32print.SetJob(hprinter, job['JobId'], 0, None, win32print.JOB_CONTROL_DELETE)
-                    cleared_count += 1
-                except:
-                    pass
-            
-            win32print.ClosePrinter(hprinter)
-            
-            if cleared_count > 0:
-                clear_windows_spooler()
-                log(f"Auto-cleared {cleared_count} stuck jobs from printer", "INFO")
-                LAST_PRINTER_CLEAR = current_time
-                return True
-        else:
-            win32print.ClosePrinter(hprinter)
-        
-    except Exception as e:
-        log(f"Auto-clear attempt failed: {e}", "WARN")
-    
-    return False
-
-# ==============================
-# FILE UTILITY FUNCTIONS
-# ==============================
-
-def is_file_locked(filepath):
-    """Check if file is locked by another process"""
-    if not os.path.exists(filepath):
-        return False
-    
-    try:
-        with open(filepath, 'rb') as f:
-            f.read(1)
-        return False
-    except (IOError, OSError):
-        return True
-
-def is_file_stable(filepath, wait_seconds=1):
-    """Check if file is completely written and stable"""
-    if not os.path.exists(filepath):
-        return False
-    
-    try:
-        if is_file_locked(filepath):
+        if not os.path.exists(file_path):
+            log(f"File does not exist: {file_path}", "ERROR")
             return False
         
-        size1 = os.path.getsize(filepath)
-        if size1 == 0:
+        file_size = os.path.getsize(file_path)
+        if file_size < 100:
+            log(f"PDF file is too small ({file_size} bytes) - might be empty", "ERROR")
             return False
-            
-        time.sleep(wait_seconds)
-        size2 = os.path.getsize(filepath)
-        return size1 == size2
-    except:
-        return False
-
-def is_valid_pdf(filepath):
-    """Quick check if file is a valid PDF"""
-    try:
-        with open(filepath, 'rb') as f:
+        
+        with open(file_path, 'rb') as f:
             header = f.read(5)
-            return header == b'%PDF-'
-    except:
+            if header != b'%PDF-':
+                log(f"File does not have valid PDF header: {header}", "ERROR")
+                return False
+        
+        log(f"PDF validation passed: {os.path.basename(file_path)} ({file_size} bytes)", "INFO")
+        return True
+    except Exception as e:
+        log(f"Error validating PDF: {e}", "ERROR")
         return False
 
-def is_network_path(path):
-    """Check if path is on network drive"""
-    try:
-        drive = os.path.splitdrive(path)[0]
-        if drive:
-            DRIVE_REMOTE = 4
-            return ctypes.windll.kernel32.GetDriveTypeW(drive) == DRIVE_REMOTE
-    except:
-        pass
+def wait_for_file_stability(file_path, timeout=5):
+    """Wait for file to be completely written"""
+    start_time = time.time()
+    last_size = -1
+    stable_count = 0
+    
+    while time.time() - start_time < timeout:
+        try:
+            if not os.path.exists(file_path):
+                time.sleep(0.5)
+                continue
+                
+            current_size = os.path.getsize(file_path)
+            
+            if current_size == last_size:
+                stable_count += 1
+                if stable_count >= 3:
+                    return True
+            else:
+                stable_count = 0
+                last_size = current_size
+            
+            time.sleep(0.5)
+        except:
+            time.sleep(0.5)
+    
+    log(f"File stability timeout for: {os.path.basename(file_path)}", "WARN")
     return False
 
 # ==============================
-# AUTO-UPDATER (YOUR ORIGINAL CODE - UNCHANGED)
+# AUTO-UPDATER
 # ==============================
 
 def _parse_version(v: str):
-    """Convert '1.2.3' → (1, 2, 3) for safe semantic comparison."""
     try:
         return tuple(int(x) for x in str(v).strip().split("."))
     except Exception:
@@ -431,10 +253,9 @@ def _parse_version(v: str):
 
 def _apply_direct_update(exe_url: str, remote_ver: str,
                           remote_sha: str, silent: bool, parent_win):
-    """
-    DIRECT EXE update flow  (release_type == "direct")
-    """
-    current_exe = sys.executable if getattr(sys, "frozen", False) \
+    import urllib.request
+
+    current_exe  = sys.executable if getattr(sys, "frozen", False) \
                    else os.path.abspath(__file__)
     app_dir      = os.path.dirname(current_exe)
     update_path  = os.path.join(app_dir, "update_new.exe")
@@ -442,7 +263,6 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
 
     log("Downloading update…", "UPDATE")
 
-    # Download
     dl_req = urllib.request.Request(
         exe_url,
         headers={"User-Agent": "MargERPAutoPrinter-Updater"}
@@ -457,14 +277,12 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
             out_f.write(chunk)
             hasher.update(chunk)
 
-    # Size guard
     if os.path.getsize(update_path) < 100_000:
         log("Downloaded file too small — aborting.", "ERROR")
         try: os.remove(update_path)
         except Exception: pass
         return
 
-    # Optional SHA-256 check
     if remote_sha:
         actual_sha = hasher.hexdigest().lower()
         if actual_sha != remote_sha.lower():
@@ -482,7 +300,6 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
 
     pid = os.getpid()
 
-    # Detect protected install directory
     protected = (
         os.environ.get("ProgramFiles",      "C:\\Program Files"),
         os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
@@ -493,7 +310,6 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
     )
 
     if needs_elevation:
-        # Use PowerShell Start-Process -Verb RunAs to elevate updater
         log("Protected dir — requesting UAC elevation for updater…", "UPDATE")
         args = f'{pid} "{update_path}" "{current_exe}"'
         ps_cmd = (
@@ -514,14 +330,15 @@ def _apply_direct_update(exe_url: str, remote_ver: str,
         )
 
     log("Updater launched — shutting down now…", "UPDATE")
+
     stop_event.set()
     get_root().after(0, get_root().destroy)
 
+    
 def _apply_installer_update(exe_url: str, remote_ver: str,
                              remote_sha: str, silent: bool, parent_win):
-    """
-    INSTALLER EXE update flow  (release_type == "installer")
-    """
+    import urllib.request
+
     current_exe = sys.executable if getattr(sys, "frozen", False) \
                   else os.path.abspath(__file__)
     app_dir      = os.path.dirname(current_exe)
@@ -529,7 +346,6 @@ def _apply_installer_update(exe_url: str, remote_ver: str,
 
     log("Downloading installer update…", "UPDATE")
 
-    # Download
     dl_req = urllib.request.Request(
         exe_url,
         headers={"User-Agent": "MargERPAutoPrinter-Updater"}
@@ -544,14 +360,12 @@ def _apply_installer_update(exe_url: str, remote_ver: str,
             out_f.write(chunk)
             hasher.update(chunk)
 
-    # Size guard
     if os.path.getsize(setup_path) < 100_000:
         log("Downloaded installer too small — aborting.", "ERROR")
         try: os.remove(setup_path)
         except Exception: pass
         return
 
-    # Optional SHA-256 validation
     if remote_sha:
         actual_sha = hasher.hexdigest().lower()
         if actual_sha != remote_sha.lower():
@@ -577,7 +391,6 @@ def _apply_installer_update(exe_url: str, remote_ver: str,
         if answer:
             log("User confirmed — launching installer…", "UPDATE")
             try:
-                # ShellExecute with "runas" triggers proper UAC elevation
                 ctypes.windll.shell32.ShellExecuteW(
                     None, "runas", setup_path, None, None, 1
                 )
@@ -595,14 +408,13 @@ def _apply_installer_update(exe_url: str, remote_ver: str,
 
     get_root().after(0, _prompt)
 
+
 def _do_update_check(silent: bool = True, parent_win=None):
-    """
-    Core update logic — runs in a background thread.
-    """
     try:
+        import urllib.request
+
         log("Checking for updates…", "UPDATE")
 
-        # Fetch version manifest
         req = urllib.request.Request(
             UPDATE_VERSION_URL,
             headers={"User-Agent": "MargERPAutoPrinter-Updater"}
@@ -614,11 +426,9 @@ def _do_update_check(silent: bool = True, parent_win=None):
         exe_url       = data.get("exe_url",       "")
         remote_sha    = data.get("sha256",        "").lower()
         release_type  = data.get("release_type", "direct").lower()
-        
         if release_type not in ("direct", "installer"):
             release_type = "direct"
 
-        # Already up to date?
         if _parse_version(remote_ver) <= _parse_version(APP_VERSION):
             log(f"Already up to date  (v{APP_VERSION})", "SUCCESS")
             if not silent:
@@ -634,7 +444,6 @@ def _do_update_check(silent: bool = True, parent_win=None):
         log(f"Update available!  v{APP_VERSION}  →  v{remote_ver}  "
             f"[type: {release_type}]", "UPDATE")
 
-        # Route to the correct update handler
         if release_type == "installer":
             _apply_installer_update(exe_url, remote_ver, remote_sha,
                                     silent, parent_win)
@@ -660,8 +469,8 @@ def _do_update_check(silent: bool = True, parent_win=None):
                 )
             get_root().after(0, _err)
 
+
 def start_update_check(silent: bool = True, parent_win=None):
-    """Kick off update check in a non-blocking daemon thread."""
     t = threading.Thread(
         target=_do_update_check,
         args=(silent, parent_win),
@@ -670,8 +479,9 @@ def start_update_check(silent: bool = True, parent_win=None):
     )
     t.start()
 
+
 # ==============================
-# FIRST-TIME SETUP WINDOW (YOUR ORIGINAL - UNCHANGED)
+# FIRST-TIME SETUP WINDOW
 # ==============================
 
 def first_time_setup() -> dict:
@@ -680,7 +490,7 @@ def first_time_setup() -> dict:
 
     win = tk.Toplevel(root)
     win.title("Marg ERP Auto Printer — Setup")
-    win.geometry("520x570")
+    win.geometry("520x720")
     win.resizable(False, False)
     win.configure(bg=THEME["bg"])
     win.grab_set()
@@ -746,6 +556,55 @@ def first_time_setup() -> dict:
                    bg=THEME["bg"], selectcolor=THEME["surface2"],
                    relief="flat", bd=0, activebackground=THEME["bg"]).pack(side="right", padx=4)
 
+    portrait_var = tk.BooleanVar(value=False)
+    pf = tk.Frame(form, bg=THEME["bg"]); pf.pack(fill="x", pady=(10,0))
+    tk.Label(pf, text="📱  Force Portrait Mode",
+             font=FONT_LABEL, fg=THEME["text"], bg=THEME["bg"]).pack(side="left")
+    portrait_ind = tk.Label(pf, text="OFF ", bg=THEME["text_dim"], fg=THEME["bg"],
+                            font=("Segoe UI", 8, "bold"), padx=6, pady=2)
+    portrait_ind.pack(side="right")
+    def _tog_portrait():
+        portrait_ind.config(bg=THEME["success"] if portrait_var.get() else THEME["text_dim"],
+                           text="ON " if portrait_var.get() else "OFF")
+    tk.Checkbutton(pf, variable=portrait_var, command=_tog_portrait,
+                   bg=THEME["bg"], selectcolor=THEME["surface2"],
+                   relief="flat", bd=0, activebackground=THEME["bg"]).pack(side="right", padx=4)
+    
+    pdftoprinter_var = tk.BooleanVar(value=True)
+    pdfpf = tk.Frame(form, bg=THEME["bg"]); pdfpf.pack(fill="x", pady=(10,0))
+    tk.Label(pdfpf, text="📄  Use PDFtoPrinter_m.exe (Recommended)",
+             font=FONT_LABEL, fg=THEME["text"], bg=THEME["bg"]).pack(side="left")
+    pdftoprinter_ind = tk.Label(pdfpf, text="ON ", bg=THEME["success"], fg=THEME["bg"],
+                                font=("Segoe UI", 8, "bold"), padx=6, pady=2)
+    pdftoprinter_ind.pack(side="right")
+    def _tog_pdftoprinter():
+        pdftoprinter_ind.config(bg=THEME["success"] if pdftoprinter_var.get() else THEME["text_dim"],
+                               text="ON " if pdftoprinter_var.get() else "OFF")
+    tk.Checkbutton(pdfpf, variable=pdftoprinter_var, command=_tog_pdftoprinter,
+                   bg=THEME["bg"], selectcolor=THEME["surface2"],
+                   relief="flat", bd=0, activebackground=THEME["bg"]).pack(side="right", padx=4)
+    
+    fast_var = tk.BooleanVar(value=True)
+    ff = tk.Frame(form, bg=THEME["bg"]); ff.pack(fill="x", pady=(10,0))
+    tk.Label(ff, text="⚡  Fast Mode (Skip Validation) - Recommended",
+             font=FONT_LABEL, fg=THEME["text"], bg=THEME["bg"]).pack(side="left")
+    fast_ind = tk.Label(ff, text="ON ", bg=THEME["success"], fg=THEME["bg"],
+                        font=("Segoe UI", 8, "bold"), padx=6, pady=2)
+    fast_ind.pack(side="right")
+    def _tog_fast():
+        fast_ind.config(bg=THEME["success"] if fast_var.get() else THEME["text_dim"],
+                       text="ON " if fast_var.get() else "OFF")
+    tk.Checkbutton(ff, variable=fast_var, command=_tog_fast,
+                   bg=THEME["bg"], selectcolor=THEME["surface2"],
+                   relief="flat", bd=0, activebackground=THEME["bg"]).pack(side="right", padx=4)
+    
+    info_frame = tk.Frame(form, bg=THEME["surface2"], pady=6, padx=10)
+    info_frame.pack(fill="x", pady=(10,0))
+    tk.Label(info_frame, 
+             text="Fast Mode: Prints immediately (2-3 seconds faster)\nDisable only if you're getting corrupted PDFs",
+             font=("Segoe UI", 8), fg=THEME["text_dim"], bg=THEME["surface2"],
+             justify="left", wraplength=450).pack(anchor="w")
+
     tk.Frame(win, bg=THEME["border"], height=1).pack(fill="x", padx=30)
 
     def _save():
@@ -758,6 +617,9 @@ def first_time_setup() -> dict:
                 "file_prefix":    prefix_var.get(),
                 "check_interval": int(interval_var.get()),
                 "silent_mode":    silent_var.get(),
+                "force_portrait": portrait_var.get(),
+                "use_pdftoprinter": pdftoprinter_var.get(),
+                "fast_mode":      fast_var.get(),
             })
             with open(CONFIG_FILE, "w") as f:
                 json.dump(result, f, indent=4)
@@ -779,7 +641,7 @@ def first_time_setup() -> dict:
     return result
 
 # ==============================
-# LOAD CONFIG (YOUR ORIGINAL - UNCHANGED)
+# LOAD CONFIG
 # ==============================
 
 def load_config() -> dict:
@@ -798,214 +660,301 @@ WATCH_FOLDER     = CONFIG.get("watch_folder",   DEFAULT_CONFIG["watch_folder"])
 FILE_PREFIX      = CONFIG.get("file_prefix",    DEFAULT_CONFIG["file_prefix"])
 CHECK_INTERVAL   = CONFIG.get("check_interval", DEFAULT_CONFIG["check_interval"])
 USE_SILENT_MODE  = CONFIG.get("silent_mode",    DEFAULT_CONFIG["silent_mode"])
+FORCE_PORTRAIT   = CONFIG.get("force_portrait", DEFAULT_CONFIG["force_portrait"])
+USE_PDFTOPRINTER = CONFIG.get("use_pdftoprinter", DEFAULT_CONFIG["use_pdftoprinter"])
+FAST_MODE        = CONFIG.get("fast_mode",      DEFAULT_CONFIG["fast_mode"])
+
+if not os.path.exists(CORRUPTED_FOLDER):
+    try:
+        os.makedirs(CORRUPTED_FOLDER)
+    except:
+        pass
 
 # ==============================
-# PRINT FUNCTIONS (YOUR ORIGINAL - ENHANCED BUT PRESERVED)
+# FIXED PRINT FUNCTIONS - NO TIMEOUTS
 # ==============================
+
+def safe_delete_file(fp: str, max_attempts: int = 3):
+    """Safely delete file with retries"""
+    for attempt in range(max_attempts):
+        try:
+            if os.path.exists(fp):
+                os.remove(fp)
+                log(f"File deleted: {os.path.basename(fp)}", "SUCCESS")
+                return True
+        except (PermissionError, OSError):
+            if attempt < max_attempts - 1:
+                log(f"File in use, retrying deletion...", "INFO")
+                time.sleep(1)
+                continue
+            log(f"Could not delete file after {max_attempts} attempts: {os.path.basename(fp)}", "WARN")
+        except Exception as e:
+            log(f"Error deleting file: {e}", "ERROR")
+            break
+    return False
 
 def print_pdf_legacy(fp: str):
+    """Legacy Windows print (fallback)"""
     try:
+        log(f"Using legacy print for: {os.path.basename(fp)}", "WARN")
         win32print.SetDefaultPrinter(SELECTED_PRINTER)
         win32api.ShellExecute(0, "print", fp, None, ".", 0)
         time.sleep(5)
-        if os.path.exists(fp): 
-            try:
-                os.remove(fp)
-            except:
-                pass
+        safe_delete_file(fp)
     except Exception as e:
         log(f"Legacy print error: {e}", "ERROR")
 
-def print_pdf_silent(fp: str):
+def print_pdf_with_pdftoprinter_fast(fp: str):
+    """Fast version - NO TIMEOUT, just wait"""
+    try:
+        if not os.path.exists(PDFTOPRINTER_PATH):
+            print_pdf_with_sumatra_fast(fp)
+            return
+        
+        log(f"⚡ Fast printing with PDFtoPrinter: {os.path.basename(fp)}", "PRINT")
+        
+        cmd = [PDFTOPRINTER_PATH, fp, SELECTED_PRINTER]
+        
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        
+        # Just wait - no timeout
+        process.wait()
+        time.sleep(1)  # Small delay for file release
+        
+        safe_delete_file(fp)
+            
+    except Exception as e:
+        log(f"Fast print error: {e}", "ERROR")
+        # Don't fallback - just log error, file will be picked up again if needed
+
+def print_pdf_with_sumatra_fast(fp: str):
+    """Fast version with Sumatra - NO TIMEOUT"""
+    try:
+        if not os.path.exists(SUMATRA_PATH):
+            print_pdf_legacy(fp)
+            return
+        
+        cmd = [
+            SUMATRA_PATH,
+            "-print-to", SELECTED_PRINTER,
+            "-print-settings", "noscale",
+            "-silent",
+            "-exit-on-print",
+        ]
+        
+        if FORCE_PORTRAIT:
+            cmd.insert(1, "-orientation")
+            cmd.insert(2, "portrait")
+        
+        cmd.append(fp)
+        
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        
+        # Just wait - no timeout
+        process.wait()
+        time.sleep(1)
+        
+        safe_delete_file(fp)
+            
+    except Exception as e:
+        log(f"Fast print error: {e}", "ERROR")
+
+def print_pdf_with_pdftoprinter(fp: str):
+    """Regular version with validation - NO TIMEOUT"""
+    try:
+        if not os.path.exists(PDFTOPRINTER_PATH):
+            log("PDFtoPrinter_m.exe not found, falling back to Sumatra", "WARN")
+            print_pdf_with_sumatra(fp)
+            return
+        
+        log(f"Using PDFtoPrinter_m.exe for: {os.path.basename(fp)}", "PRINT")
+        
+        cmd = [PDFTOPRINTER_PATH, fp, SELECTED_PRINTER]
+        
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        
+        # Just wait - no timeout
+        process.wait()
+        time.sleep(2)
+        
+        safe_delete_file(fp)
+            
+    except Exception as e:
+        log(f"PDFtoPrinter error: {e}", "ERROR")
+
+def print_pdf_with_sumatra(fp: str):
+    """Regular version with Sumatra - NO TIMEOUT"""
     try:
         if not os.path.exists(SUMATRA_PATH):
             log("SumatraPDF not found — legacy fallback", "WARN")
             print_pdf_legacy(fp)
             return
         
-        # Kill any hanging Sumatra processes first (added for stability)
-        subprocess.run(["taskkill", "/F", "/IM", "SumatraPDF.exe"], 
-                      capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        time.sleep(1)
+        cmd = [
+            SUMATRA_PATH,
+            "-print-to", SELECTED_PRINTER,
+            "-print-settings", "noscale",
+            "-silent",
+            "-exit-on-print",
+        ]
         
-        # Validate PDF before printing (added for stability)
-        if not is_valid_pdf(fp):
-            log(f"Invalid or corrupted PDF: {os.path.basename(fp)}", "ERROR")
-            try:
-                os.remove(fp)
-            except:
-                pass
-            return
+        if FORCE_PORTRAIT:
+            cmd.insert(1, "-orientation")
+            cmd.insert(2, "portrait")
         
-        # Original print command
+        cmd.append(fp)
+        
         process = subprocess.Popen(
-            [
-                SUMATRA_PATH,
-                "-print-to", SELECTED_PRINTER,
-                "-print-settings", "noscale",
-                "-silent",
-                "-exit-on-print",
-                fp
-            ],
+            cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         
-        # Added timeout protection
-        try:
-            process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            log(f"Print timeout for: {os.path.basename(fp)}", "ERROR")
-            return
-        
+        # Just wait - no timeout
+        process.wait()
         time.sleep(2)
-        if os.path.exists(fp):
-            try:
-                os.remove(fp)
-            except Exception as e:
-                log(f"Could not delete {os.path.basename(fp)}: {e}", "WARN")
-                
+        
+        safe_delete_file(fp)
+            
     except Exception as e:
-        log(f"Silent print error: {e}", "ERROR")
-        print_pdf_legacy(fp)
+        log(f"Sumatra print error: {e}", "ERROR")
+
+# ==============================
+# MAIN PRINT FUNCTION
+# ==============================
 
 def print_pdf(fp: str):
+    """Main print function - processes one file at a time"""
     name = os.path.basename(fp)
-    log(f"Sending → {name}", "PRINT")
-    print_pdf_silent(fp) if USE_SILENT_MODE else print_pdf_legacy(fp)
-    log(f"Done — {name}", "SUCCESS")
-
-# ==============================
-# PRINT QUEUE MANAGEMENT (ENHANCED - AUTO ONLY)
-# ==============================
-
-def _enqueue_file(fp: str):
-    """Thread-safe: add a file to the print queue only once with deduplication"""
-    with _queued_lock:
-        filename = os.path.basename(fp)
-        current_time = time.time()
-        
-        # Clean old entries - prevent memory leak
-        if len(PROCESSED_FILES) > MAX_PROCESSED_FILES:
-            sorted_files = sorted(PROCESSED_FILES.items(), key=lambda x: x[1])
-            for f, _ in sorted_files[:200]:
-                del PROCESSED_FILES[f]
-        
-        # Remove expired entries
-        expired = [f for f, ts in PROCESSED_FILES.items() 
-                   if current_time - ts > PROCESSED_EXPIRY]
-        for f in expired:
-            del PROCESSED_FILES[f]
-        
-        # Check if recently processed
-        if filename in PROCESSED_FILES:
-            log(f"Skipping duplicate: {filename} (processed {current_time - PROCESSED_FILES[filename]:.1f}s ago)", "WATCH")
+    log(f"Processing → {name}", "PRINT")
+    
+    try:
+        # FAST MODE
+        if FAST_MODE:
+            log(f"⚡ Fast Mode enabled", "INFO")
+            if USE_PDFTOPRINTER and os.path.exists(PDFTOPRINTER_PATH):
+                print_pdf_with_pdftoprinter_fast(fp)
+            else:
+                print_pdf_with_sumatra_fast(fp)
+            log(f"✅ Completed — {name}", "SUCCESS")
             return
         
+        # NORMAL MODE
+        log(f"Normal Mode - validating PDF", "INFO")
+        
+        if not wait_for_file_stability(fp):
+            log(f"File may still be in use: {name}", "WARN")
+        
+        if not validate_pdf_file(fp):
+            log(f"⚠️ PDF validation failed for {name}", "ERROR")
+            try:
+                new_path = os.path.join(CORRUPTED_FOLDER, name)
+                counter = 1
+                while os.path.exists(new_path):
+                    name_parts = os.path.splitext(name)
+                    new_name = f"{name_parts[0]}_{counter}{name_parts[1]}"
+                    new_path = os.path.join(CORRUPTED_FOLDER, new_name)
+                    counter += 1
+                os.rename(fp, new_path)
+                log(f"Moved corrupted file to: {new_path}", "INFO")
+            except Exception as e:
+                log(f"Failed to move corrupted file: {e}", "ERROR")
+            return
+        
+        if USE_PDFTOPRINTER and os.path.exists(PDFTOPRINTER_PATH):
+            print_pdf_with_pdftoprinter(fp)
+        else:
+            print_pdf_with_sumatra(fp)
+        
+        log(f"✅ Completed — {name}", "SUCCESS")
+        
+    except Exception as e:
+        log(f"❌ Error processing {name}: {e}", "ERROR")
+
+# ==============================
+# PRINT QUEUE - GUARANTEED SINGLE PRINTS
+# ==============================
+
+_print_queue   = queue.Queue()
+_queued_files  = set()
+_queued_lock   = threading.Lock()
+_current_print = None
+_current_lock  = threading.Lock()
+
+def _enqueue_file(fp: str):
+    """Thread-safe: add a file to the print queue only once."""
+    with _queued_lock:
         if fp not in _queued_files:
             _queued_files.add(fp)
-            PROCESSED_FILES[filename] = current_time
             _print_queue.put(fp)
-            log(f"Queued  → {filename} (queue depth: {_print_queue.qsize()})", "WATCH")
+            log(f"Queued  → {os.path.basename(fp)}  (depth: {_print_queue.qsize()})", "WATCH")
 
 def print_worker():
-    """Worker thread that processes the print queue (enhanced with auto-clear)"""
+    """Worker thread - processes ONE file at a time"""
     log("Print worker started — ready for jobs.", "INFO")
-    consecutive_errors = 0
-    consecutive_printer_failures = 0
-    
     while not stop_event.is_set():
         try:
             fp = _print_queue.get(timeout=1)
         except queue.Empty:
             continue
-            
+        
+        # Mark as current print
+        with _current_lock:
+            global _current_print
+            _current_print = fp
+        
         try:
             if os.path.exists(fp):
-                # Check printer status (internal only)
-                printer_ready, printer_status, printer_jobs = get_printer_status_detailed(SELECTED_PRINTER)
-                
-                # AUTO-CLEAR: If printer has too many stuck jobs
-                if printer_jobs > 5:
-                    log(f"Printer has {printer_jobs} stuck jobs, auto-clearing...", "WARN")
-                    auto_clear_printer_queue(SELECTED_PRINTER)
-                    time.sleep(3)
-                
-                if not printer_ready:
-                    log(f"Printer not ready: {printer_status}", "ERROR")
-                    consecutive_printer_failures += 1
-                    
-                    # AUTO-CLEAR: After multiple failures
-                    if consecutive_printer_failures >= MAX_CONSECUTIVE_FAILURES:
-                        log(f"Multiple printer failures ({consecutive_printer_failures}), auto-clearing...", "WARN")
-                        auto_clear_printer_queue(SELECTED_PRINTER)
-                        time.sleep(5)
-                        consecutive_printer_failures = 0
-                    
-                    # Requeue the file
-                    time.sleep(5)
-                    with _queued_lock:
-                        _queued_files.discard(fp)
-                        _queued_files.add(fp)
-                        _print_queue.put(fp)
-                    continue
-                
-                consecutive_printer_failures = 0
-                
-                # Original print
                 print_pdf(fp)
-                consecutive_errors = 0
-                        
             else:
                 log(f"File gone before printing: {os.path.basename(fp)}", "WARN")
-                
         except Exception as e:
-            log(f"Print worker error ({os.path.basename(fp)}): {e}", "ERROR")
-            consecutive_errors += 1
-            
-            # AUTO-CLEAR: After too many errors
-            if consecutive_errors > 3:
-                log("Too many consecutive errors, auto-clearing printer...", "ERROR")
-                auto_clear_printer_queue(SELECTED_PRINTER)
-                time.sleep(10)
-                consecutive_errors = 0
-            
+            log(f"Print worker error: {e}", "ERROR")
         finally:
+            # Remove from queue tracking
             with _queued_lock:
                 _queued_files.discard(fp)
+            # Clear current print
+            with _current_lock:
+                _current_print = None
             _print_queue.task_done()
 
 # ==============================
-# FILE WATCHER (ENHANCED - AUTO ONLY)
+# FILE WATCHER
 # ==============================
 
 def get_marg_files():
     if not os.path.exists(WATCH_FOLDER):
         log(f"Watch folder missing: {WATCH_FOLDER}", "ERROR"); return []
-    
-    files = [
-        os.path.join(WATCH_FOLDER, f)
-        for f in os.listdir(WATCH_FOLDER)
-        if f.startswith(FILE_PREFIX) and f.lower().endswith(".pdf")
-    ]
-    
-    is_network = is_network_path(WATCH_FOLDER)
-    
-    processable_files = []
-    for f in files:
-        if is_file_locked(f):
-            continue
-        
-        stability_wait = 2 if is_network else 1
-        if not is_file_stable(f, stability_wait):
-            continue
-        
-        processable_files.append(f)
-    
-    processable_files.sort(key=os.path.getctime)
-    return processable_files
+    try:
+        files = [
+            os.path.join(WATCH_FOLDER, f)
+            for f in os.listdir(WATCH_FOLDER)
+            if f.startswith(FILE_PREFIX) and f.lower().endswith(".pdf")
+        ]
+        files.sort(key=os.path.getctime)
+        return files
+    except Exception as e:
+        log(f"Error reading folder: {e}", "ERROR")
+        return []
+
+stop_event = threading.Event()
 
 def watcher_loop():
     log("Auto Printer started — watching for PDFs…", "WATCH")
@@ -1013,37 +962,23 @@ def watcher_loop():
     log(f"Folder  : {WATCH_FOLDER}",     "INFO")
     log(f"Prefix  : {FILE_PREFIX}",      "INFO")
     log(f"Version : v{APP_VERSION}",     "INFO")
-    
-    last_scan_time = 0
-    min_scan_interval = 1
-    
+    log(f"Mode    : {'PDFtoPrinter' if USE_PDFTOPRINTER else 'Sumatra'}", "INFO")
+    log(f"Portrait: {'ON' if FORCE_PORTRAIT else 'OFF'}", "INFO")
+    log(f"Fast Mode: {'ON' if FAST_MODE else 'OFF'}", "INFO")
     while not stop_event.is_set():
-        current_time = time.time()
-        
-        if current_time - last_scan_time >= min_scan_interval:
-            files = get_marg_files()
-            for fp in files[:10]:
-                if stop_event.is_set():
-                    break
-                _enqueue_file(fp)
-            last_scan_time = current_time
-        
-        queue_size = _print_queue.qsize()
-        if queue_size > 20:
-            sleep_time = max(0.5, CHECK_INTERVAL / 2)
-        elif queue_size > 10:
-            sleep_time = CHECK_INTERVAL
-        else:
-            sleep_time = CHECK_INTERVAL * 1.5
-        
-        stop_event.wait(sleep_time)
+        for fp in get_marg_files():
+            if stop_event.is_set():
+                break
+            _enqueue_file(fp)
+        stop_event.wait(CHECK_INTERVAL)
 
 # ==============================
-# LOG WINDOW (YOUR ORIGINAL - EXACTLY AS BEFORE)
+# LOG WINDOW
 # ==============================
 
 _log_win_open = False
 _log_win_ref  = None
+
 
 def open_log_window():
     global _log_win_open, _log_win_ref
@@ -1060,7 +995,7 @@ def open_log_window():
     root = get_root()
     win  = tk.Toplevel(root)
     _log_win_ref = win
-    win.title("Marg ERP Auto Printer (Beta Version) — Live Logs")
+    win.title("Marg ERP Auto Printer — Live Logs")
     win.geometry("860x530")
     win.configure(bg=THEME["bg"])
     if os.path.exists(ICON_PATH):
@@ -1085,11 +1020,14 @@ def open_log_window():
              fg=THEME["success"], bg=THEME["surface"]).pack(side="right", padx=10)
 
     info = tk.Frame(win, bg=THEME["surface2"], pady=4); info.pack(fill="x")
+    mode_text = "PDFtoPrinter" if USE_PDFTOPRINTER else "Sumatra"
     tk.Label(info,
              text=(f"  Printer: {SELECTED_PRINTER}   │   Folder: {WATCH_FOLDER}"
                    f"   │   Prefix: {FILE_PREFIX}   │   "
                    f"Interval: {CHECK_INTERVAL}s   │   "
-                   f"Silent: {'ON' if USE_SILENT_MODE else 'OFF'}"),
+                   f"Mode: {mode_text}   │   "
+                   f"Portrait: {'ON' if FORCE_PORTRAIT else 'OFF'}   │   "
+                   f"Fast: {'ON' if FAST_MODE else 'OFF'}"),
              font=("Consolas", 8), fg=THEME["text_dim"],
              bg=THEME["surface2"], anchor="w").pack(fill="x", padx=12)
 
@@ -1132,8 +1070,6 @@ def open_log_window():
         log("Manual update check requested…", "UPDATE")
         start_update_check(silent=False, parent_win=win)
 
-    # NO PRINTER CLEAR BUTTON - REMOVED
-
     tk.Button(bb, text="🗑  Clear",         command=_clear,               **bkw).pack(side="left",  padx=(12,4))
     tk.Button(bb, text="📋  Copy",          command=_copy,                **bkw).pack(side="left",  padx=4)
     tk.Button(bb, text="🔄  Check Updates", command=_check_update_manual,
@@ -1158,14 +1094,14 @@ def open_log_window():
     _poll()
 
 # ==============================
-# CONFIG EDIT WINDOW (YOUR ORIGINAL - UNCHANGED)
+# CONFIG EDIT WINDOW
 # ==============================
 
 def open_config_window():
     root = get_root()
     win  = tk.Toplevel(root)
     win.title("Edit Configuration")
-    win.geometry("520x560")
+    win.geometry("520x720")
     win.configure(bg=THEME["bg"])
     if os.path.exists(ICON_PATH):
         try: win.iconbitmap(ICON_PATH)
@@ -1218,6 +1154,37 @@ def open_config_window():
                    selectcolor=THEME["surface2"], relief="flat", bd=0,
                    activebackground=THEME["bg"]).pack(side="right")
 
+    portrait_var = tk.BooleanVar(value=FORCE_PORTRAIT)
+    pf = tk.Frame(form, bg=THEME["bg"]); pf.pack(fill="x", pady=(10,0))
+    tk.Label(pf, text="📱  Force Portrait Mode", font=FONT_LABEL,
+             fg=THEME["text"], bg=THEME["bg"]).pack(side="left")
+    tk.Checkbutton(pf, variable=portrait_var, bg=THEME["bg"],
+                   selectcolor=THEME["surface2"], relief="flat", bd=0,
+                   activebackground=THEME["bg"]).pack(side="right")
+
+    pdftoprinter_var = tk.BooleanVar(value=USE_PDFTOPRINTER)
+    pdfpf = tk.Frame(form, bg=THEME["bg"]); pdfpf.pack(fill="x", pady=(10,0))
+    tk.Label(pdfpf, text="📄  Use PDFtoPrinter_m.exe", font=FONT_LABEL,
+             fg=THEME["text"], bg=THEME["bg"]).pack(side="left")
+    tk.Checkbutton(pdfpf, variable=pdftoprinter_var, bg=THEME["bg"],
+                   selectcolor=THEME["surface2"], relief="flat", bd=0,
+                   activebackground=THEME["bg"]).pack(side="right")
+    
+    fast_var = tk.BooleanVar(value=FAST_MODE)
+    ff = tk.Frame(form, bg=THEME["bg"]); ff.pack(fill="x", pady=(10,0))
+    tk.Label(ff, text="⚡  Fast Mode (Skip Validation)", font=FONT_LABEL,
+             fg=THEME["text"], bg=THEME["bg"]).pack(side="left")
+    tk.Checkbutton(ff, variable=fast_var, bg=THEME["bg"],
+                   selectcolor=THEME["surface2"], relief="flat", bd=0,
+                   activebackground=THEME["bg"]).pack(side="right")
+    
+    info_frame = tk.Frame(form, bg=THEME["surface2"], pady=6, padx=10)
+    info_frame.pack(fill="x", pady=(10,0))
+    tk.Label(info_frame, 
+             text="Fast Mode: Prints immediately (2-3 sec faster). Disable if getting corrupted PDFs.",
+             font=("Segoe UI", 8), fg=THEME["text_dim"], bg=THEME["surface2"],
+             justify="left", wraplength=450).pack(anchor="w")
+
     def _save():
         try:
             cfg = {
@@ -1226,6 +1193,9 @@ def open_config_window():
                 "file_prefix":    prefix_var.get(),
                 "check_interval": int(interval_var.get()),
                 "silent_mode":    silent_var.get(),
+                "force_portrait": portrait_var.get(),
+                "use_pdftoprinter": pdftoprinter_var.get(),
+                "fast_mode":      fast_var.get(),
             }
             with open(CONFIG_FILE, "w") as f:
                 json.dump(cfg, f, indent=4)
@@ -1249,7 +1219,7 @@ def open_config_window():
              font=FONT_CREDIT, fg=THEME["text_dim"], bg=THEME["bg"]).pack(pady=(0,10))
 
 # ==============================
-# ABOUT / VERSION WINDOW (YOUR ORIGINAL - UNCHANGED)
+# ABOUT / VERSION WINDOW
 # ==============================
 
 def open_about_window():
@@ -1295,7 +1265,7 @@ def open_about_window():
              font=FONT_CREDIT, fg=THEME["text_dim"], bg=THEME["bg"]).pack(pady=8)
 
 # ==============================
-# SYSTEM TRAY ICON (YOUR ORIGINAL - MINIMAL ENHANCEMENT)
+# SYSTEM TRAY ICON
 # ==============================
 
 def _make_tray_image() -> Image.Image:
@@ -1324,8 +1294,6 @@ def _tray_check_update(icon, item):
         log("Manual update check from system tray…", "UPDATE")
         start_update_check(silent=False, parent_win=None)
     get_root().after(0, _run)
-
-# NO PRINTER CLEAR MENU ITEM - REMOVED
 
 def _tray_exit(icon, item):
     log("Shutting down…", "WARN")
@@ -1357,19 +1325,15 @@ def build_tray() -> pystray.Icon:
     )
 
 # ==============================
-# MAIN (YOUR ORIGINAL - UNCHANGED)
+# MAIN
 # ==============================
 
 def main():
-    log(f"Marg ERP Auto Printer v{APP_VERSION} starting...", "INFO")
-    
     start_update_check(silent=True)
     threading.Thread(target=print_worker, daemon=True, name="PrintWorker").start()
     threading.Thread(target=watcher_loop, daemon=True, name="Watcher").start()
     tray = build_tray()
     threading.Thread(target=tray.run, daemon=True, name="Tray").start()
-    
-    log("Application started successfully", "SUCCESS")
     get_root().mainloop()
 
 if __name__ == "__main__":

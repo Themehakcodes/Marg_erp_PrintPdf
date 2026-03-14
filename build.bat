@@ -1,8 +1,6 @@
-Copy
-
 @echo off
 REM ================================================================
-REM  Marg ERP Auto Printer — Build Script
+REM  Marg ERP Auto Printer — Build Script (CLEANED)
 REM  Developed by Mehak Singh | TheMehakCodes
 REM ================================================================
 
@@ -15,14 +13,15 @@ echo.
 
 echo [1/5] Cleaning old build files...
 echo ------------------------------------------------
-if exist build rmdir /s /q build
 if exist marg_auto_printer.spec del marg_auto_printer.spec
-if exist marg_updater.spec       del marg_updater.spec
+if exist marg_updater.spec del marg_updater.spec
+if exist "dist\marg_auto_printer.exe" del "dist\marg_auto_printer.exe"
+if exist "dist\marg_updater.exe" del "dist\marg_updater.exe"
 
 echo.
 echo [2/5] Installing / upgrading dependencies...
 echo ------------------------------------------------
-pip install --upgrade pyinstaller pywin32 pystray pillow requests
+pip install --upgrade pyinstaller pywin32 pystray pillow requests PyMuPDF
 
 echo.
 echo [3/5] Building main application (onefile)...
@@ -37,6 +36,7 @@ pyinstaller ^
 --add-data "logo.ico;." ^
 --add-data "logo.png;." ^
 --add-data "SumatraPDF.exe;." ^
+--add-data "PDFtoPrinter_m.exe;." ^
 --hidden-import win32api ^
 --hidden-import win32con ^
 --hidden-import win32event ^
@@ -49,6 +49,7 @@ pyinstaller ^
 --hidden-import PIL._imaging ^
 --hidden-import PIL.Image ^
 --hidden-import PIL.ImageDraw ^
+--hidden-import fitz ^
 --hidden-import queue ^
 --hidden-import threading ^
 --hidden-import logging ^
@@ -67,6 +68,7 @@ pyinstaller ^
 --collect-all pystray ^
 --collect-all PIL ^
 --collect-all tkinter ^
+--collect-all fitz ^
 --exclude-module matplotlib ^
 --exclude-module numpy ^
 --exclude-module pandas ^
@@ -93,22 +95,37 @@ echo ------------------------------------------------
 if exist "dist\marg_auto_printer.exe" (
     if exist "dist\marg_updater.exe" (
         echo.
-        echo BUILD SUCCESSFUL
+        echo ========== BUILD SUCCESSFUL ==========
         echo.
         echo Output files:
         echo   dist\marg_auto_printer.exe   -- main app
-        echo   dist\marg_updater.exe        -- updater (bundle with installer)
+        echo   dist\marg_updater.exe        -- updater
+        echo.
+        echo File sizes:
+        for %%I in ("dist\marg_auto_printer.exe") do echo   main app: %%~zI bytes
+        for %%I in ("dist\marg_updater.exe") do echo   updater:  %%~zI bytes
         echo.
         echo Next steps:
         echo   1. Copy BOTH EXEs to your InstallerBuild folder
-        echo   2. Compile installer using Inno Setup
+        echo   2. Test the EXE: dist\marg_auto_printer.exe
+        echo   3. If working, compile installer with Inno Setup
         echo.
     ) else (
-        echo Main app built but updater FAILED - check errors above.
+        echo.
+        echo ⚠️  Main app built but updater FAILED
+        echo    Check errors above.
+        echo.
     )
 ) else (
     echo.
-    echo BUILD FAILED - Check errors above.
+    echo ========== BUILD FAILED ==========
+    echo.
+    echo Check errors above. Common issues:
+    echo   - Missing PyMuPDF: pip install PyMuPDF
+    echo   - Missing logo.ico file
+    echo   - Missing SumatraPDF.exe
+    echo   - Missing PDFtoPrinter_m.exe
+    echo.
 )
 
 echo.

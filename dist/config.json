@@ -1,0 +1,8 @@
+{
+    "printer": "WORKING OLD SNBC [TEZ](Mobility)",
+    "watch_folder": "C:\\Users\\KC\\Downloads",
+    "file_prefix": "Marg_erp",
+    "check_interval": 3,
+    "silent_mode": true,
+    "use_pdftoprinter": true
+}
